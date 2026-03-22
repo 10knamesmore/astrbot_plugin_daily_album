@@ -385,13 +385,16 @@ class DailyAlbumPlugin(Star):
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
             return
 
+        song_id = await self._search_netease_song_id(album.album_name, album.artist)
         chain = await self._build_chain(album, sessions[0])
+        if not song_id:
+            hint = await self._generate_not_found_hint(
+                album.album_name, album.artist, sessions[0]
+            )
+            chain.message(hint)
         for session in sessions:
             try:
                 await StarTools.send_message(session, chain)
-                song_id = await self._search_netease_song_id(
-                    album.album_name, album.artist
-                )
                 if song_id:
                     await self._send_music_card(session, song_id)
                 logger.info(
@@ -400,6 +403,37 @@ class DailyAlbumPlugin(Star):
                 await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"[DailyAlbum] 发送到 {session} 失败：{e}")
+
+    async def _generate_not_found_hint(
+        self, album_name: str, artist: list[str], umo: str
+    ) -> str:
+        provider = self.ctx.get_using_provider()
+        fallback = (
+            f"\n未能在网易云找到「{album_name}」，"
+            "可以去 Spotify / Apple Music / 网易云 / BandCamp 手动搜索哦～"
+        )
+        if not provider:
+            return fallback
+        _, persona, _, _ = await self.ctx.persona_manager.resolve_selected_persona(
+            umo=umo,
+            conversation_persona_id=None,
+            platform_name=umo.split(":", 1)[0],
+        )
+        persona_prompt = (persona or {}).get("prompt", "")
+        try:
+            resp = await self.ctx.llm_generate(
+                chat_provider_id=provider.meta().id,
+                prompt=(
+                    f"今日推荐的专辑是《{album_name}》，艺术家：{', '.join(artist)}。"
+                    "在网易云音乐上没有找到这张专辑。"
+                    "请用你自己的风格，说一句让用户可以去其他平台"
+                    "自行搜索的提示。直接输出这句话，不要加任何前缀或解释。"
+                ),
+                system_prompt=persona_prompt or "你是一个热爱音乐的推荐者。",
+            )
+            return "\n" + resp.completion_text.strip()
+        except Exception:
+            return fallback
 
     # -------------------------------------------------------------------------
     # 命令
