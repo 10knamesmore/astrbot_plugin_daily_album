@@ -264,7 +264,10 @@ class DailyAlbumPlugin(Star):
                     data = await resp.json(content_type=None)
             songs = data.get("result", {}).get("songs", [])
             if songs:
-                return str(songs[0]["id"])
+                sid = str(songs[0]["id"])
+                logger.info(f"[DailyAlbum] 网易云搜索到歌曲 ID={sid}，歌名={songs[0].get('name', '')!r}")
+                return sid
+            logger.warning(f"[DailyAlbum] 网易云搜索无结果，keyword={keyword!r}")
         except Exception as e:
             logger.warning(f"[DailyAlbum] 网易云搜索失败：{e}")
         return None
@@ -296,6 +299,7 @@ class DailyAlbumPlugin(Star):
                 await bot.api.call_action("send_group_msg", group_id=int(session.session_id), **payload)
             else:
                 await bot.api.call_action("send_private_msg", user_id=int(session.session_id), **payload)
+            logger.info(f"[DailyAlbum] 音乐卡片已发送：song_id={song_id} → {session_str}")
         except Exception as e:
             logger.warning(f"[DailyAlbum] 音乐卡片发送失败：{e}")
 
