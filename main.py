@@ -261,7 +261,7 @@ class DailyAlbumPlugin(Star):
                 prompt=(
                     f"目标专辑：《{target_name}》，艺术家：{', '.join(target_artist)}\n"
                     f"搜索结果：《{candidate_name}》，艺术家：{candidate_artist}\n\n"
-                    "这个搜索结果是目标专辑吗？只回答 yes 或 no。"
+                    "判断搜索结果是否是目标专辑（同一张专辑的 Deluxe Edition、Remastered、Anniversary Edition 等版本均视为匹配）。只回答 yes 或 no。"
                 ),
                 system_prompt="你是音乐数据核验助手，只输出 yes 或 no，不输出任何其他内容。",
             )
@@ -480,6 +480,7 @@ class DailyAlbumPlugin(Star):
             prompt = (
                 f"现在是 {now}。{action}，需要让用户{wait}。"
                 f"请{style}，直接输出这句话，不要加任何前缀或解释。"
+                f"不要在这一部分推荐任何音乐"
             )
             resp = await self.ctx.llm_generate(
                 chat_provider_id=provider.meta().id,
