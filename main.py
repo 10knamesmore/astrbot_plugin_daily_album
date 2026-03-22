@@ -280,64 +280,68 @@ class DailyAlbumPlugin(Star):
         import aiohttp
 
         max_attempts = int(self.config.get("netease_search_max_attempts", 3))
-        keyword = f"{album_name} {' '.join(artist)}"
         timeout = aiohttp.ClientTimeout(total=8)
+
+        # 依次尝试的关键词：先"专辑名 艺术家"，再纯"专辑名"
+        keywords = [f"{album_name} {' '.join(artist)}", album_name]
 
         try:
             async with aiohttp.ClientSession(cookies={"appver": "2.0.2"}) as session:
-                # 一次拉取多条，按序逐一核验
-                async with session.post(
-                    "http://music.163.com/api/search/get/web",
-                    data={"s": keyword, "limit": max_attempts, "type": 10, "offset": 0},
-                    timeout=timeout,
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                    logging.debug(f"[DailyAlbum] 网易云专辑搜索，keyword={keyword!r}")
-
-                albums = data.get("result", {}).get("albums", [])
-                if not albums:
-                    logger.warning(
-                        f"[DailyAlbum] 网易云专辑搜索无结果，keyword={keyword!r}"
-                    )
-                    return None
-
-                for i, album in enumerate(albums):
-                    album_id = album["id"]
-                    album_title = album.get("name", "")
-                    album_artist = album.get("artist", {}).get("name", "")
-                    logger.info(
-                        f"[DailyAlbum] 候选专辑 [{i + 1}/{len(albums)}] "
-                        f"ID={album_id}，名称={album_title!r}，艺术家={album_artist!r}"
-                    )
-
-                    matched = await self._is_target_album(
-                        album_title, album_artist, album_name, artist
-                    )
-                    if not matched:
-                        logger.info("[DailyAlbum] LLM 判定不匹配，跳过")
-                        continue
-
-                    # 拉专辑详情取第一首歌
-                    async with session.get(
-                        f"http://music.163.com/api/album/{album_id}",
+                for keyword in keywords:
+                    async with session.post(
+                        "http://music.163.com/api/search/get/web",
+                        data={"s": keyword, "limit": max_attempts, "type": 10, "offset": 0},
                         timeout=timeout,
                     ) as resp:
-                        detail = await resp.json(content_type=None)
+                        data = await resp.json(content_type=None)
 
-                    songs = detail.get("album", {}).get("songs", [])
-                    if not songs:
+                    albums = data.get("result", {}).get("albums", [])
+                    if not albums:
                         logger.warning(
-                            f"[DailyAlbum] 专辑 {album_id} 歌曲列表为空，继续尝试"
+                            f"[DailyAlbum] 网易云专辑搜索无结果，keyword={keyword!r}"
                         )
                         continue
 
-                    sid = str(songs[0]["id"])
-                    logger.info(
-                        f"[DailyAlbum] 取专辑第一首歌 ID={sid}，歌名={songs[0].get('name', '')!r}"
-                    )
-                    return sid
+                    for i, album in enumerate(albums):
+                        album_id = album["id"]
+                        album_title = album.get("name", "")
+                        album_artist = album.get("artist", {}).get("name", "")
+                        logger.info(
+                            f"[DailyAlbum] 候选专辑 [{i + 1}/{len(albums)}]（keyword={keyword!r}）"
+                            f" ID={album_id}，名称={album_title!r}，艺术家={album_artist!r}"
+                        )
 
-                logger.warning(f"[DailyAlbum] {len(albums)} 条候选均未通过核验，放弃")
+                        matched = await self._is_target_album(
+                            album_title, album_artist, album_name, artist
+                        )
+                        if not matched:
+                            logger.info("[DailyAlbum] LLM 判定不匹配，跳过")
+                            continue
+
+                        async with session.get(
+                            f"http://music.163.com/api/album/{album_id}",
+                            timeout=timeout,
+                        ) as resp:
+                            detail = await resp.json(content_type=None)
+
+                        songs = detail.get("album", {}).get("songs", [])
+                        if not songs:
+                            logger.warning(
+                                f"[DailyAlbum] 专辑 {album_id} 歌曲列表为空，继续尝试"
+                            )
+                            continue
+
+                        sid = str(songs[0]["id"])
+                        logger.info(
+                            f"[DailyAlbum] 取专辑第一首歌 ID={sid}，歌名={songs[0].get('name', '')!r}"
+                        )
+                        return sid
+
+                    logger.warning(
+                        f"[DailyAlbum] keyword={keyword!r} 的 {len(albums)} 条候选均未通过核验，尝试下一关键词"
+                    )
+
+                logger.warning("[DailyAlbum] 所有关键词均未找到匹配专辑，放弃")
         except Exception as e:
             logger.warning(f"[DailyAlbum] 网易云搜索失败：{e}")
         return None
