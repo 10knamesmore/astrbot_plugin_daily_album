@@ -245,57 +245,59 @@ class DailyAlbumPlugin(Star):
                 f"{album.album_name}  {' / '.join(album.artist)}",
             ]
             text = "\n".join(lines)
-
         chain = MessageChain()
-        netease = await self._search_netease_album(album.album_name, album.artist)
-        if netease:
-            import hashlib
-            import time
-            from astrbot.api.message_components import Json
-            ctime = int(time.time())
-            token = hashlib.md5(f"{netease['id']}{ctime}".encode()).hexdigest()
-            card = {
-                "app": "com.tencent.tuwen.lua",
-                "bizsrc": "qqconnect.sdkshare",
-                "config": {"ctime": ctime, "forward": 1, "token": token, "type": "normal"},
-                "meta": {
-                    "news": {
-                        "desc": f"歌手：{' / '.join(album.artist)}",
-                        "jumpUrl": f"http://music.163.com/album/{netease['id']}/",
-                        "preview": netease["pic_url"],
-                        "tag": "网易云音乐",
-                        "tagIcon": "https://i.gtimg.cn/open/app_icon/00/49/50/85/100495085_100_m.png",
-                        "title": f"专辑：{album.album_name}",
-                    }
-                },
-                "prompt": f"[分享]专辑：{album.album_name}",
-                "ver": "0.0.0.1",
-                "view": "news",
-            }
-            chain.chain.append(Json(data=card))
         chain.message(text)
         return chain
 
-    async def _search_netease_album(self, album_name: str, artist: list[str]) -> dict | None:
-        """搜索网易云专辑，返回 {id, pic_url}；失败返回 None"""
+    async def _search_netease_song_id(self, album_name: str, artist: list[str]) -> str | None:
+        """搜索网易云，返回专辑第一首歌的歌曲 ID；失败返回 None"""
         import aiohttp
         keyword = f"{album_name} {' '.join(artist)}"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     "http://music.163.com/api/search/get/web",
-                    data={"s": keyword, "limit": 1, "type": 10, "offset": 0},
+                    data={"s": keyword, "limit": 1, "type": 1, "offset": 0},
                     cookies={"appver": "2.0.2"},
                     timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     data = await resp.json(content_type=None)
-            albums = data.get("result", {}).get("albums", [])
-            if albums:
-                a = albums[0]
-                return {"id": str(a["id"]), "pic_url": a.get("picUrl", "")}
+            songs = data.get("result", {}).get("songs", [])
+            if songs:
+                return str(songs[0]["id"])
         except Exception as e:
             logger.warning(f"[DailyAlbum] 网易云搜索失败：{e}")
         return None
+
+    async def _send_music_card(self, session_str: str, song_id: str) -> None:
+        """发网易云音乐卡片（song_id 为歌曲 ID 字符串）"""
+        from astrbot.core.platform.message_session import MessageSession
+        from astrbot.core.platform.message_type import MessageType
+
+        try:
+            session = MessageSession.from_str(session_str)
+        except Exception:
+            return
+
+        platform = None
+        for p in self.ctx.platform_manager.platform_insts:
+            if p.meta().id == session.platform_name:
+                platform = p
+                break
+        if platform is None:
+            return
+        bot = getattr(platform, "bot", None)
+        if bot is None:
+            return
+
+        payload = {"message": [{"type": "music", "data": {"type": "163", "id": song_id}}]}
+        try:
+            if session.message_type == MessageType.GROUP_MESSAGE:
+                await bot.api.call_action("send_group_msg", group_id=int(session.session_id), **payload)
+            else:
+                await bot.api.call_action("send_private_msg", user_id=int(session.session_id), **payload)
+        except Exception as e:
+            logger.warning(f"[DailyAlbum] 音乐卡片发送失败：{e}")
 
     async def _send_to_sessions(self, album: AlbumInfo) -> None:
         sessions: list[str] = self.config.get("target_sessions", [])
@@ -303,9 +305,12 @@ class DailyAlbumPlugin(Star):
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
             return
 
+        song_id = await self._search_netease_song_id(album.album_name, album.artist)
         chain = await self._build_chain(album, sessions[0])
         for session in sessions:
             try:
+                if song_id:
+                    await self._send_music_card(session, song_id)
                 await StarTools.send_message(session, chain)
                 logger.info(
                     f"[DailyAlbum] 已推送到 {session}：{album.album_name} / {album.artist}"
