@@ -1,0 +1,12 @@
+name: 每日专辑推荐
+desc: 每日专辑推荐 - 定时向指定会话推送一张专辑推荐，支持 LLM、联网搜索、自定义脚本三种来源
+help: |
+  /album_today  - 手动触发并推送专辑推荐到当前会话
+  /album_history - 查看最近 10 条推荐历史
+
+  自定义脚本外部依赖：
+    在脚本顶部声明 REQUIREMENTS = ["spotipy>=2.0", "requests"]
+    插件会在首次加载时自动 pip install 缺失的包。
+version: v1.0.0
+author: wanger
+repo: https://github.com/example/astrbot_plugin_daily_album

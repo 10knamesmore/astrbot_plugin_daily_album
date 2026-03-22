@@ -1,0 +1,299 @@
+"""
+astrbot_plugin_daily_album - 每日专辑推荐插件
+
+每天定时向配置的群/私聊推送一张专辑推荐。
+专辑来源可插拔：llm（纯 LLM）、web_search（联网+LLM）、script（用户自定义脚本）。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import cast
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, StarTools, register
+
+from .sources import AlbumInfo, select_source
+
+PLUGIN_NAME = "astrbot_plugin_daily_album"
+HISTORY_FILE = "album_history.json"
+
+
+def _dedup_key(album_name: str, artist: list[str]) -> str:
+    """生成去重 key，忽略大小写和首尾空格"""
+    artist_key = ",".join(a.strip().lower() for a in artist)
+    return f"{album_name.strip().lower()}:{artist_key}"
+
+
+@register(
+    PLUGIN_NAME,
+    "auto",
+    "每日专辑推荐 - 定时向指定会话推送一张专辑推荐，支持 LLM、联网搜索、自定义脚本",
+    "1.0.0",
+)
+class DailyAlbumPlugin(Star):
+    def __init__(self, context: Context, config: dict):
+        super().__init__(context)
+        self.config = config
+
+        self._data_dir: Path = StarTools.get_data_dir(PLUGIN_NAME)
+        self._history_path: Path = self._data_dir / HISTORY_FILE
+        self._history: dict = self._load_history()
+
+        self._lock = asyncio.Lock()
+        self._cron_job_id: str | None = None
+
+        asyncio.create_task(self._init())
+
+    @property
+    def ctx(self) -> Context:
+        """返回具备完整类型提示的 Context。"""
+        return cast(Context, self.context)
+
+    # -------------------------------------------------------------------------
+    # 初始化
+    # -------------------------------------------------------------------------
+
+    async def _init(self) -> None:
+        await asyncio.sleep(5)  # 等待框架就绪
+        await self._setup_cron()
+
+    async def terminate(self) -> None:
+        if self._cron_job_id:
+            try:
+                await self.ctx.cron_manager.delete_job(self._cron_job_id)
+            except Exception:
+                pass
+
+    # -------------------------------------------------------------------------
+    # 持久化
+    # -------------------------------------------------------------------------
+
+    def _load_history(self) -> dict:
+        if self._history_path.exists():
+            try:
+                return json.loads(self._history_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"[DailyAlbum] 读取历史文件失败：{e}，使用空历史")
+        return {"last_push_date": "", "records": [], "seen_keys": []}
+
+    def _save_history(self) -> None:
+        try:
+            self._history_path.write_text(
+                json.dumps(self._history, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.error(f"[DailyAlbum] 写入历史文件失败：{e}")
+
+    # -------------------------------------------------------------------------
+    # 定时任务
+    # -------------------------------------------------------------------------
+
+    async def _setup_cron(self) -> None:
+        push_time = self.config.get("push_time", "10:00")
+        try:
+            hour_str, minute_str = push_time.split(":")
+            hour, minute = int(hour_str), int(minute_str)
+        except Exception:
+            logger.warning(
+                f"[DailyAlbum] push_time 格式无效：{push_time!r}，使用 10:00"
+            )
+            hour, minute = 10, 0
+
+        try:
+            job = await self.ctx.cron_manager.add_basic_job(
+                name=f"{PLUGIN_NAME}_daily",
+                cron_expression=f"{minute} {hour} * * *",
+                handler=self._daily_handler,
+                description="每日专辑推荐",
+                persistent=False,
+            )
+            self._cron_job_id = job.job_id
+            logger.info(
+                f"[DailyAlbum] 定时任务已注册，时间={hour:02d}:{minute:02d}，job_id={job.job_id}"
+            )
+        except Exception as e:
+            logger.error(f"[DailyAlbum] 注册定时任务失败：{e}")
+
+    async def _daily_handler(self, **_kwargs) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._history.get("last_push_date") == today:
+            logger.info("[DailyAlbum] 今日已推送，跳过（防重启重复）")
+            return
+        await self._run_recommend()
+
+    # -------------------------------------------------------------------------
+    # 核心推荐流程
+    # -------------------------------------------------------------------------
+
+    async def _run_recommend(self) -> None:
+        async with self._lock:
+            records = self._history.get("records", [])
+            history_list = [
+                AlbumInfo(
+                    album_name=r["album_name"],
+                    artist=r["artist"],
+                    year=r.get("year", ""),
+                    genre=r.get("genre", []),
+                    cover_url=r.get("cover_url", ""),
+                    description=r.get("description", ""),
+                    listen_tip=r.get("listen_tip", ""),
+                )
+                for r in records
+            ]
+            seen_keys: set[str] = set(self._history.get("seen_keys", []))
+
+            prompt = self.config.get(
+                "recommend_prompt",
+                "请推荐一张值得深度聆听的经典或当代优秀专辑，涵盖各种音乐风格，注重艺术性和可听性。",
+            )
+
+            # 去重重试：rejected 列表追加到 history 末尾，让模型看到刚才被拒的专辑
+            MAX_RETRIES = 3
+            album = None
+            rejected: list[AlbumInfo] = []
+            for attempt in range(1, MAX_RETRIES + 1):
+                source = select_source(self.context, self.config)
+                candidate = await source.fetch(prompt, history_list + rejected)
+                if not candidate:
+                    logger.error("[DailyAlbum] 来源未能返回有效专辑，本次跳过")
+                    return
+                key = _dedup_key(candidate.album_name, candidate.artist)
+                if key not in seen_keys:
+                    album = candidate
+                    break
+                logger.info(
+                    f"[DailyAlbum] 命中重复专辑 {candidate.album_name}/{candidate.artist}，"
+                    f"重新生成（{attempt}/{MAX_RETRIES}）"
+                )
+                rejected.append(candidate)
+
+            if album is None:
+                logger.error(
+                    f"[DailyAlbum] 重试 {MAX_RETRIES} 次后仍返回重复专辑，本次跳过"
+                )
+                return
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            key = _dedup_key(album.album_name, album.artist)
+            record = {
+                **asdict(album),
+                "date": today,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+            self._history.setdefault("records", []).append(record)
+            self._history.setdefault("seen_keys", []).append(key)
+            self._history["last_push_date"] = today
+            self._save_history()
+
+            await self._send_to_sessions(album)
+
+    # -------------------------------------------------------------------------
+    # 消息构建与发送
+    # -------------------------------------------------------------------------
+
+    async def _generate_text(self, album: AlbumInfo) -> str:
+        provider = self.ctx.get_using_provider()
+        if not provider:
+            return ""
+        persona = await self.ctx.persona_manager.get_default_persona_v3()
+        persona_prompt = persona.get("prompt", "") if persona else ""
+        album_json = json.dumps(asdict(album), ensure_ascii=False)
+        prompt = (
+            f"以下是今日推荐的专辑信息（JSON）：\n{album_json}\n\n"
+            "请用你自己的风格写一段今日专辑推荐文案，要自然、有感染力，"
+            "不要逐字复述字段，像是在跟朋友分享。直接输出文案，不要加任何前缀或解释。"
+        )
+        try:
+            resp = await self.ctx.llm_generate(
+                chat_provider_id=provider.meta().id,
+                prompt=prompt,
+                system_prompt=persona_prompt or "你是一个热爱音乐的推荐者。",
+            )
+            return resp.completion_text.strip()
+        except Exception as e:
+            logger.warning(f"[DailyAlbum] 文案生成失败：{e}")
+            return ""
+
+    async def _build_chain(self, album: AlbumInfo) -> MessageChain:
+        text = await self._generate_text(album)
+        if not text:
+            today = datetime.now().strftime("%Y年%m月%d日")
+            lines = [
+                f"今日专辑推荐 | {today}",
+                "",
+                f"{album.album_name}  {' / '.join(album.artist)}",
+            ]
+            text = "\n".join(lines)
+
+        chain = MessageChain()
+
+        if album.netease_id.strip().isdigit():
+            from astrbot.core.message.components import Music
+
+            chain.chain.append(
+                Music(
+                    _type="163",
+                    id=int(album.netease_id),
+                    title=album.album_name,
+                    content=" / ".join(album.artist),
+                    image=album.cover_url if album.cover_url.startswith("http") else "",
+                )
+            )
+        elif album.cover_url.startswith("http"):
+            chain.url_image(album.cover_url)
+
+        chain.message(text)
+        return chain
+
+    async def _send_to_sessions(self, album: AlbumInfo) -> None:
+        sessions: list[str] = self.config.get("target_sessions", [])
+        if not sessions:
+            logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
+            return
+
+        chain = await self._build_chain(album)
+        for session in sessions:
+            try:
+                await StarTools.send_message(session, chain)
+                logger.info(
+                    f"[DailyAlbum] 已推送到 {session}：{album.album_name} / {album.artist}"
+                )
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"[DailyAlbum] 发送到 {session} 失败：{e}")
+
+    # -------------------------------------------------------------------------
+    # 命令
+    # -------------------------------------------------------------------------
+
+    @filter.command("album_today")
+    async def cmd_today(self, event: AstrMessageEvent):
+        """手动触发，推送到当前会话"""
+        yield event.plain_result("正在生成今日专辑推荐，请稍候...")
+        original_sessions = list(self.config.get("target_sessions", []))
+        self.config["target_sessions"] = [event.unified_msg_origin]
+        try:
+            await self._run_recommend()
+        finally:
+            self.config["target_sessions"] = original_sessions
+        event.stop_event()
+
+    @filter.command("album_history")
+    async def cmd_history(self, event: AstrMessageEvent):
+        """查看最近 10 条推荐历史"""
+        records = self._history.get("records", [])[-10:]
+        if not records:
+            yield event.plain_result("还没有推荐记录。")
+            return
+        lines = ["最近推荐："] + [
+            f"{r['date']}  {r['album_name']} / {r['artist']}" for r in records
+        ]
+        yield event.plain_result("\n".join(lines))
+        event.stop_event()

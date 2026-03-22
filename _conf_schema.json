@@ -1,0 +1,89 @@
+{
+  "target_sessions": {
+    "type": "list",
+    "description": "推送目标会话列表",
+    "hint": "填写 unified_msg_origin 格式的会话 ID，如 aiocqhttp:GroupMessage:123456。可添加多个。",
+    "default": []
+  },
+  "push_time": {
+    "type": "string",
+    "description": "每日推送时间（HH:MM，服务器时区）",
+    "hint": "每天定时推送专辑推荐的时间，格式为 HH:MM，例如 10:00。",
+    "default": "10:00"
+  },
+  "recommend_prompt": {
+    "type": "string",
+    "description": "推荐风格偏好描述",
+    "hint": "描述你希望推荐的专辑类型、风格、年代等偏好，LLM 将据此推荐。",
+    "default": "请推荐一张值得深度聆听的经典或当代优秀专辑，涵盖各种音乐风格，注重艺术性和可听性。"
+  },
+  "source_llm": {
+    "description": "LLM 来源配置",
+    "type": "object",
+    "items": {
+      "source_llm_enabled": {
+        "type": "bool",
+        "description": "启用 LLM 来源",
+        "hint": "启用后，纯 LLM 生成专辑推荐将参与随机抽取。",
+        "default": true
+      },
+      "source_llm_weight": {
+        "type": "int",
+        "description": "LLM 来源权重",
+        "hint": "相对权重，数字越大被选中概率越高。仅在该来源启用时生效。",
+        "default": 1
+      }
+    }
+  },
+  "source_web_search": {
+    "description": "联网搜索来源配置",
+    "type": "object",
+    "items": {
+      "source_web_search_enabled": {
+        "type": "bool",
+        "description": "启用联网搜索来源",
+        "hint": "启用后，联网搜索 + LLM 总结的方式将参与随机抽取。需要配置 Tavily Key 或可访问 Bing。",
+        "default": true
+      },
+      "source_web_search_weight": {
+        "type": "int",
+        "description": "联网搜索来源权重",
+        "hint": "相对权重，数字越大被选中概率越高。仅在该来源启用时生效。",
+        "default": 2
+      }
+    }
+  },
+  "source_script": {
+    "description": "自定义脚本来源配置",
+    "type": "object",
+    "items": {
+      "source_script_enabled": {
+        "type": "bool",
+        "description": "启用自定义脚本来源",
+        "hint": "启用后，用户自定义 Python 脚本将参与随机抽取。",
+        "default": false
+      },
+      "source_script_weight": {
+        "type": "int",
+        "description": "自定义脚本来源权重",
+        "hint": "相对权重，数字越大被选中概率越高。仅在该来源启用时生效。",
+        "default": 1
+      },
+      "script_file": {
+        "type": "file",
+        "description": "自定义脚本文件",
+        "hint": "上传你的 Python 脚本，脚本需实现 async def fetch_album(prompt: str, history: list[dict]) -> dict。",
+        "default": [],
+        "file_types": [
+          "py"
+        ]
+      }
+    }
+  },
+  "max_history_in_prompt": {
+    "type": "int",
+    "description": "注入 prompt 的历史记录数量上限",
+    "hint": "向 LLM 提供的已推荐历史条数，用于避免重复推荐。数字越大避重效果越好，但 prompt 也越长。",
+    "default": 30
+  }
+}
