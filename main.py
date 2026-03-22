@@ -233,9 +233,6 @@ class DailyAlbumPlugin(Star):
             text = "\n".join(lines)
 
         chain = MessageChain()
-        # 有 netease_id 时音乐卡片已含封面，跳过图片（LLM 生成的 URL 也不可靠）
-        if not album.netease_id.strip().isdigit() and album.cover_url.startswith("http"):
-            chain.url_image(album.cover_url)
         chain.message(text)
         return chain
 
