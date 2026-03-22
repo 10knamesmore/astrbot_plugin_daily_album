@@ -7,6 +7,6 @@ help: |
   自定义脚本外部依赖：
     在脚本顶部声明 REQUIREMENTS = ["spotipy>=2.0", "requests"]
     插件会在首次加载时自动 pip install 缺失的包。
-version: v0.0.2
+version: v0.0.3
 author: wanger
 repo: https://github.com/10knamesmore/astrbot_plugin_daily_album
