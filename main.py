@@ -385,11 +385,13 @@ class DailyAlbumPlugin(Star):
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
             return
 
-        song_id = await self._search_netease_song_id(album.album_name, album.artist)
         chain = await self._build_chain(album, sessions[0])
         for session in sessions:
             try:
                 await StarTools.send_message(session, chain)
+                song_id = await self._search_netease_song_id(
+                    album.album_name, album.artist
+                )
                 if song_id:
                     await self._send_music_card(session, song_id)
                 logger.info(
