@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 from dataclasses import asdict
 from datetime import datetime
@@ -291,6 +292,7 @@ class DailyAlbumPlugin(Star):
                     timeout=timeout,
                 ) as resp:
                     data = await resp.json(content_type=None)
+                    logging.debug(f"[DailyAlbum] 网易云专辑搜索，keyword={keyword!r}")
 
                 albums = data.get("result", {}).get("albums", [])
                 if not albums:
