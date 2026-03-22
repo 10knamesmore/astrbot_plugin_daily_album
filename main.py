@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import random
 from dataclasses import asdict
 from datetime import datetime
@@ -290,7 +289,12 @@ class DailyAlbumPlugin(Star):
                 for keyword in keywords:
                     async with session.post(
                         "http://music.163.com/api/search/get/web",
-                        data={"s": keyword, "limit": max_attempts, "type": 10, "offset": 0},
+                        data={
+                            "s": keyword,
+                            "limit": max_attempts,
+                            "type": 10,
+                            "offset": 0,
+                        },
                         timeout=timeout,
                     ) as resp:
                         data = await resp.json(content_type=None)
