@@ -198,12 +198,26 @@ class DailyAlbumPlugin(Star):
     # 消息构建与发送
     # -------------------------------------------------------------------------
 
-    async def _generate_text(self, album: AlbumInfo) -> str:
+    async def _generate_text(self, album: AlbumInfo, umo: str) -> str:
         provider = self.ctx.get_using_provider()
         if not provider:
             return ""
-        persona = await self.ctx.persona_manager.get_default_persona_v3()
-        persona_prompt = persona.get("prompt", "") if persona else ""
+
+        # 解析该会话当前生效的人格
+        cid = await self.ctx.conversation_manager.get_curr_conversation_id(umo)
+        conv_persona_id = None
+        if cid:
+            conv = await self.ctx.conversation_manager.get_conversation(umo, cid)
+            if conv:
+                conv_persona_id = getattr(conv, "persona_id", None)
+        platform_name = umo.split(":", 1)[0]
+        _, persona, _, _ = await self.ctx.persona_manager.resolve_selected_persona(
+            umo=umo,
+            conversation_persona_id=conv_persona_id,
+            platform_name=platform_name,
+        )
+        persona_prompt = (persona or {}).get("prompt", "")
+
         album_json = json.dumps(asdict(album), ensure_ascii=False)
         prompt = (
             f"以下是今日推荐的专辑信息（JSON）：\n{album_json}\n\n"
@@ -221,8 +235,8 @@ class DailyAlbumPlugin(Star):
             logger.warning(f"[DailyAlbum] 文案生成失败：{e}")
             return ""
 
-    async def _build_chain(self, album: AlbumInfo) -> MessageChain:
-        text = await self._generate_text(album)
+    async def _build_chain(self, album: AlbumInfo, umo: str) -> MessageChain:
+        text = await self._generate_text(album, umo)
         if not text:
             today = datetime.now().strftime("%Y年%m月%d日")
             lines = [
@@ -273,7 +287,7 @@ class DailyAlbumPlugin(Star):
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
             return
 
-        chain = await self._build_chain(album)
+        chain = await self._build_chain(album, sessions[0])
         for session in sessions:
             try:
                 if album.netease_id.strip().isdigit():
