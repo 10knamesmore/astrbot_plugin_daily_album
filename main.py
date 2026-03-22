@@ -233,7 +233,8 @@ class DailyAlbumPlugin(Star):
             text = "\n".join(lines)
 
         chain = MessageChain()
-        if album.cover_url.startswith("http"):
+        # 有 netease_id 时音乐卡片已含封面，跳过图片（LLM 生成的 URL 也不可靠）
+        if not album.netease_id.strip().isdigit() and album.cover_url.startswith("http"):
             chain.url_image(album.cover_url)
         chain.message(text)
         return chain
@@ -266,10 +267,10 @@ class DailyAlbumPlugin(Star):
         try:
             if session.message_type == MessageType.GROUP_MESSAGE:
                 payload["group_id"] = int(session.session_id)
-                await bot.api.call_action("send_group_msg", **payload)
+                await bot.call_action("send_group_msg", **payload)
             else:
                 payload["user_id"] = int(session.session_id)
-                await bot.api.call_action("send_private_msg", **payload)
+                await bot.call_action("send_private_msg", **payload)
         except Exception as e:
             logger.warning(f"[DailyAlbum] 音乐卡片发送失败：{e}")
 
