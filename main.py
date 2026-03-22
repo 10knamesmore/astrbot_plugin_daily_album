@@ -258,16 +258,12 @@ class DailyAlbumPlugin(Star):
         if bot is None:
             return  # 非 aiocqhttp 平台
 
-        payload = {
-            "message": [{"type": "music", "data": {"type": "163", "id": netease_id}}]
-        }
+        message = [{"type": "music", "data": {"type": "163", "id": netease_id}}]
         try:
             if session.message_type == MessageType.GROUP_MESSAGE:
-                payload["group_id"] = int(session.session_id)
-                await bot.call_action("send_group_msg", **payload)
+                await bot.send_group_msg(group_id=int(session.session_id), message=message)
             else:
-                payload["user_id"] = int(session.session_id)
-                await bot.call_action("send_private_msg", **payload)
+                await bot.send_private_msg(user_id=int(session.session_id), message=message)
         except Exception as e:
             logger.warning(f"[DailyAlbum] 音乐卡片发送失败：{e}")
 
