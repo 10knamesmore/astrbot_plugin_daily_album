@@ -17,7 +17,7 @@ from typing import cast
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api.star import Context, Star, StarTools
 
 from .sources import AlbumInfo, select_source
 
@@ -31,12 +31,6 @@ def _dedup_key(album_name: str, artist: list[str]) -> str:
     return f"{album_name.strip().lower()}:{artist_key}"
 
 
-@register(
-    PLUGIN_NAME,
-    "auto",
-    "每日专辑推荐 - 定时向指定会话推送一张专辑推荐，支持 LLM、联网搜索、自定义脚本",
-    "1.0.0",
-)
 class DailyAlbumPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
@@ -253,27 +247,45 @@ class DailyAlbumPlugin(Star):
     async def _search_netease_song_id(
         self, album_name: str, artist: list[str]
     ) -> str | None:
-        """搜索网易云，返回专辑第一首歌的歌曲 ID；失败返回 None"""
+        """搜索网易云专辑，返回专辑第一首歌的歌曲 ID；失败返回 None"""
         import aiohttp
 
         keyword = f"{album_name} {' '.join(artist)}"
+        timeout = aiohttp.ClientTimeout(total=8)
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(cookies={"appver": "2.0.2"}) as session:
+                # 1. 搜索专辑
                 async with session.post(
                     "http://music.163.com/api/search/get/web",
-                    data={"s": keyword, "limit": 1, "type": 1, "offset": 0},
-                    cookies={"appver": "2.0.2"},
-                    timeout=aiohttp.ClientTimeout(total=8),
+                    data={"s": keyword, "limit": 1, "type": 10, "offset": 0},
+                    timeout=timeout,
                 ) as resp:
                     data = await resp.json(content_type=None)
-            songs = data.get("result", {}).get("songs", [])
-            if songs:
+
+                albums = data.get("result", {}).get("albums", [])
+                if not albums:
+                    logger.warning(f"[DailyAlbum] 网易云专辑搜索无结果，keyword={keyword!r}")
+                    return None
+
+                album_id = albums[0]["id"]
+                album_title = albums[0].get("name", "")
+                logger.info(f"[DailyAlbum] 网易云搜索到专辑 ID={album_id}，专辑名={album_title!r}")
+
+                # 2. 获取专辑详情，取第一首歌
+                async with session.get(
+                    f"http://music.163.com/api/album/{album_id}",
+                    timeout=timeout,
+                ) as resp:
+                    detail = await resp.json(content_type=None)
+
+                songs = detail.get("album", {}).get("songs", [])
+                if not songs:
+                    logger.warning(f"[DailyAlbum] 专辑 {album_id} 歌曲列表为空")
+                    return None
+
                 sid = str(songs[0]["id"])
-                logger.info(
-                    f"[DailyAlbum] 网易云搜索到歌曲 ID={sid}，歌名={songs[0].get('name', '')!r}"
-                )
+                logger.info(f"[DailyAlbum] 取专辑第一首歌 ID={sid}，歌名={songs[0].get('name', '')!r}")
                 return sid
-            logger.warning(f"[DailyAlbum] 网易云搜索无结果，keyword={keyword!r}")
         except Exception as e:
             logger.warning(f"[DailyAlbum] 网易云搜索失败：{e}")
         return None
@@ -353,26 +365,32 @@ class DailyAlbumPlugin(Star):
         persona_prompt = (persona or {}).get("prompt", "")
         try:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            action = random.choice([
-                "正在翻找今日值得一听的专辑",
-                "在音乐库里帮你挑一张好专辑",
-                "正在为你筛选今日的专辑推荐",
-                "正在从浩瀚的唱片里帮你找一张",
-                "稍微想了想，正在为你选一张专辑",
-            ])
-            wait = random.choice([
-                "稍等一下",
-                "请稍候",
-                "马上就来",
-                "等我一会儿",
-                "等一下下",
-            ])
-            style = random.choice([
-                "用你自己的风格说这件事",
-                "随性地表达",
-                "带点你的个性说出来",
-                "用你惯常的口吻说",
-            ])
+            action = random.choice(
+                [
+                    "正在翻找今日值得一听的专辑",
+                    "在音乐库里帮你挑一张好专辑",
+                    "正在为你筛选今日的专辑推荐",
+                    "正在从浩瀚的唱片里帮你找一张",
+                    "稍微想了想，正在为你选一张专辑",
+                ]
+            )
+            wait = random.choice(
+                [
+                    "稍等一下",
+                    "请稍候",
+                    "马上就来",
+                    "等我一会儿",
+                    "等一下下",
+                ]
+            )
+            style = random.choice(
+                [
+                    "用你自己的风格说这件事",
+                    "随性地表达",
+                    "带点你的个性说出来",
+                    "用你惯常的口吻说",
+                ]
+            )
             prompt = (
                 f"现在是 {now}。{action}，需要让用户{wait}。"
                 f"请{style}，直接输出这句话，不要加任何前缀或解释。"
