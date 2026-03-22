@@ -65,9 +65,11 @@ class WebSearchSource(AlbumSource):
         lines = []
         for r in results[:5]:
             title = r.get("title", "")
+            url = r.get("url", "")
             content = r.get("content", r.get("snippet", ""))[:300]
             if title or content:
                 lines.append(f"【{title}】\n{content}")
+                logger.info(f"[DailyAlbum] 采用搜索结果：{title!r}  {url}")
         snippets = "\n\n".join(lines) if lines else "（未获取联网信息）"
         logger.debug(f"[DailyAlbum] 搜索片段长度：{len(snippets)} 字")
         return snippets
