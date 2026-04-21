@@ -42,8 +42,9 @@ class DailyAlbumPlugin(Star):
 
         self._lock = asyncio.Lock()
         self._cron_job_id: str | None = None
+        self._cron_job_name = f"{PLUGIN_NAME}_daily"
 
-        asyncio.create_task(self._init())
+        self._init_task: asyncio.Task = asyncio.create_task(self._init())
 
     @property
     def ctx(self) -> Context:
@@ -59,10 +60,11 @@ class DailyAlbumPlugin(Star):
         await self._setup_cron()
 
     async def terminate(self) -> None:
-        if self._cron_job_id:
+        if not self._init_task.done():
+            self._init_task.cancel()
             try:
-                await self.ctx.cron_manager.delete_job(self._cron_job_id)
-            except Exception:
+                await self._init_task
+            except (asyncio.CancelledError, Exception):
                 pass
 
     # -------------------------------------------------------------------------
@@ -90,6 +92,15 @@ class DailyAlbumPlugin(Star):
     # 定时任务
     # -------------------------------------------------------------------------
 
+    async def _list_own_jobs(self) -> list:
+        """列出所有 name 等于本插件常量的 basic job。"""
+        try:
+            jobs = await self.ctx.cron_manager.list_jobs("basic")
+        except Exception as e:
+            logger.warning(f"[DailyAlbum] 列出 cron job 失败：{e}")
+            return []
+        return [j for j in jobs if getattr(j, "name", None) == self._cron_job_name]
+
     async def _setup_cron(self) -> None:
         push_time = self.config.get("push_time", "10:00")
         try:
@@ -100,11 +111,54 @@ class DailyAlbumPlugin(Star):
                 f"[DailyAlbum] push_time 格式无效：{push_time!r}，使用 10:00"
             )
             hour, minute = 10, 0
+        cron_expression = f"{minute} {hour} * * *"
+
+        existing = await self._list_own_jobs()
+
+        # 幂等复用：恰好一个、cron 一致、启用中 → 直接复用
+        if (
+            len(existing) == 1
+            and existing[0].cron_expression == cron_expression
+            and existing[0].enabled
+        ):
+            job = existing[0]
+            manager = self.ctx.cron_manager
+            # handler 存在 CronJobManager._basic_handlers 里，按 job_id 索引；
+            # reload / 进程重启后新实例的 handler 方法地址会变，需要重绑。
+            manager._basic_handlers[job.job_id] = self._daily_handler
+            # persistent=False 的 job 进程重启时被 sync_from_db 跳过，
+            # 若 scheduler 里还没这条，就补一次 _schedule_job。
+            if not manager.scheduler.get_job(job.job_id):
+                try:
+                    manager._schedule_job(job)
+                except Exception as e:
+                    logger.warning(
+                        f"[DailyAlbum] 复用 job 调度失败：{e}，回退到重建"
+                    )
+                else:
+                    self._cron_job_id = job.job_id
+                    logger.info(
+                        f"[DailyAlbum] 复用 cron job（已补回调度器）：{job.job_id}"
+                    )
+                    return
+            else:
+                self._cron_job_id = job.job_id
+                logger.info(f"[DailyAlbum] 复用 cron job：{job.job_id}")
+                return
+
+        # 不一致、重复、或复用失败 → 全清理后重建
+        for j in existing:
+            try:
+                await self.ctx.cron_manager.delete_job(j.job_id)
+                logger.info(f"[DailyAlbum] 清理旧 cron job：{j.job_id}")
+            except Exception as e:
+                logger.warning(f"[DailyAlbum] 删除旧 job {j.job_id} 失败：{e}")
+        self._cron_job_id = None
 
         try:
             job = await self.ctx.cron_manager.add_basic_job(
-                name=f"{PLUGIN_NAME}_daily",
-                cron_expression=f"{minute} {hour} * * *",
+                name=self._cron_job_name,
+                cron_expression=cron_expression,
                 handler=self._daily_handler,
                 description="每日专辑推荐",
                 persistent=False,
