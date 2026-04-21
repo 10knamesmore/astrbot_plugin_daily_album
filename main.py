@@ -214,7 +214,7 @@ class DailyAlbumPlugin(Star):
     # 核心推荐流程
     # -------------------------------------------------------------------------
 
-    async def _run_recommend(self) -> None:
+    async def _run_recommend(self, *, record_history: bool = True) -> None:
         async with self._lock:
             records: list[RecordDict] = self._history.get("records", [])
             history_list: list[AlbumInfo] = [
@@ -279,7 +279,7 @@ class DailyAlbumPlugin(Star):
             self._history["last_push_date"] = today
             self._save_history()
 
-            await self._send_to_sessions(album)
+            await self._send_to_sessions(album, record_history=record_history)
 
     # -------------------------------------------------------------------------
     # 消息构建与发送
@@ -324,7 +324,8 @@ class DailyAlbumPlugin(Star):
             logger.warning(f"[DailyAlbum] 文案生成失败：{e}")
             return ""
 
-    async def _build_chain(self, album: AlbumInfo, umo: str) -> MessageChain:
+    async def _build_text(self, album: AlbumInfo, umo: str) -> str:
+        """生成推荐文案；LLM 不可用时回退到结构化展示。"""
         text: str = await self._generate_text(album, umo)
         if not text:
             today: str = datetime.now().strftime("%Y年%m月%d日")
@@ -334,9 +335,7 @@ class DailyAlbumPlugin(Star):
                 f"{album.album_name}  {' / '.join(album.artist)}",
             ]
             text = "\n".join(lines)
-        chain: MessageChain = MessageChain()
-        chain.message(text)
-        return chain
+        return text
 
     async def _is_target_album(
         self,
@@ -490,7 +489,9 @@ class DailyAlbumPlugin(Star):
         except Exception as e:
             logger.warning(f"[DailyAlbum] 音乐卡片发送失败：{e}")
 
-    async def _send_to_sessions(self, album: AlbumInfo) -> None:
+    async def _send_to_sessions(
+        self, album: AlbumInfo, *, record_history: bool = True
+    ) -> None:
         sessions: list[str] = self.config.get("target_sessions", [])
         if not sessions:
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
@@ -499,13 +500,25 @@ class DailyAlbumPlugin(Star):
         song_id: str | None = await self._search_netease_song_id(
             album.album_name, album.artist
         )
-        chain: MessageChain = await self._build_chain(album, sessions[0])
+        recommend_text: str = await self._build_text(album, sessions[0])
+        chain: MessageChain = MessageChain().message(recommend_text)
+
+        hint_text: str = ""
         hint_chain: MessageChain | None = None
         if not song_id:
-            hint: str = await self._generate_not_found_hint(
+            hint_text = await self._generate_not_found_hint(
                 album.album_name, album.artist, sessions[0]
             )
-            hint_chain = MessageChain().message(hint)
+            hint_chain = MessageChain().message(hint_text)
+
+        # 用户配置 + 调用方传入的开关都为真才写历史
+        write_history: bool = record_history and bool(
+            self.config.get("record_history", True)
+        )
+        full_assistant_text: str = recommend_text + (
+            ("\n" + hint_text) if hint_text else ""
+        )
+
         for session in sessions:
             try:
                 await StarTools.send_message(session, chain)
@@ -517,9 +530,47 @@ class DailyAlbumPlugin(Star):
                 logger.info(
                     f"[DailyAlbum] 已推送到 {session}：{album.album_name} / {album.artist}"
                 )
+                if write_history:
+                    await self._record_to_history(
+                        session, album, full_assistant_text
+                    )
                 await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"[DailyAlbum] 发送到 {session} 失败：{e}")
+
+    async def _record_to_history(
+        self, umo: str, album: AlbumInfo, assistant_text: str
+    ) -> None:
+        """把今日推荐写入指定 session 的对话历史，供后续 LLM 上下文引用。"""
+        try:
+            cid: str | None = (
+                await self.ctx.conversation_manager.get_curr_conversation_id(umo)
+            )
+            if not cid:
+                cid = await self.ctx.conversation_manager.new_conversation(umo)
+            artist_str: str = " / ".join(album.artist)
+            user_message: dict[str, str] = {
+                "role": "user",
+                "content": (
+                    "[系统标记：此条由 daily_album 插件的每日定时任务触发，"
+                    "不是用户实际发送的消息。仅用于让你记住本日的专辑推荐内容，"
+                    "便于后续被用户问起时引用。]"
+                ),
+            }
+            assistant_message: dict[str, str] = {
+                "role": "assistant",
+                "content": (
+                    f"今日推荐《{album.album_name}》——{artist_str}。\n{assistant_text}"
+                ),
+            }
+            await self.ctx.conversation_manager.add_message_pair(
+                cid, user_message, assistant_message
+            )
+            logger.info(
+                f"[DailyAlbum] 已写入会话历史 → {umo} (cid={cid})"
+            )
+        except Exception as e:
+            logger.warning(f"[DailyAlbum] 写入会话历史失败 ({umo}): {e}")
 
     async def _generate_not_found_hint(
         self, album_name: str, artist: list[str], umo: str
@@ -648,7 +699,9 @@ class DailyAlbumPlugin(Star):
         if prompt:
             self.config["recommend_prompt"] = prompt
         try:
-            await self._run_recommend()
+            # 工具路径下，主 agent 会把工具调用结果记入历史，
+            # 这里再写一次会重复，所以强制关闭。
+            await self._run_recommend(record_history=False)
         finally:
             self.config["target_sessions"] = original_sessions
             if prompt:

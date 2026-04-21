@@ -85,5 +85,11 @@
     "description": "注入 prompt 的历史记录数量上限",
     "hint": "向 LLM 提供的已推荐历史条数，用于避免重复推荐。数字越大避重效果越好，但 prompt 也越长。",
     "default": 30
+  },
+  "record_history": {
+    "type": "bool",
+    "description": "把每日推荐写入会话历史",
+    "hint": "启用后，每次推送会以 (用户提问/助手回答) 的形式追加到目标 session 的对话历史，方便 LLM 后续被问起时引用。tool_call 路径会自动跳过避免重复。",
+    "default": true
   }
 }
