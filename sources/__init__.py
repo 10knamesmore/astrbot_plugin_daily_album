@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.star import Context
@@ -22,15 +23,15 @@ _SOURCE_DEFS: list[tuple[str, str, bool, int]] = [
 ]
 
 
-def select_source(context: Context, config: dict) -> AlbumSource:
+def select_source(context: Context, config: dict[str, Any]) -> AlbumSource:
     """根据各来源的 enabled/weight 配置加权随机选择一个来源实例。"""
     candidates: list[str] = []
     weights: list[int] = []
 
     for name, cfg_key, default_enabled, default_weight in _SOURCE_DEFS:
-        sub = config.get(cfg_key, {})
+        sub: dict[str, Any] = config.get(cfg_key, {})
         if sub.get(f"source_{name}_enabled", default_enabled):
-            weight = max(1, int(sub.get(f"source_{name}_weight", default_weight)))
+            weight: int = max(1, int(sub.get(f"source_{name}_weight", default_weight)))
             candidates.append(name)
             weights.append(weight)
 
@@ -38,7 +39,7 @@ def select_source(context: Context, config: dict) -> AlbumSource:
         logger.warning("[DailyAlbum] 所有来源均已禁用，回退到 llm")
         return LLMSource(context, config)
 
-    chosen = random.choices(candidates, weights=weights, k=1)[0]
+    chosen: str = random.choices(candidates, weights=weights, k=1)[0]
     logger.info(
         f"[DailyAlbum] 本次选择来源：{chosen}  "
         f"（候选：{list(zip(candidates, weights))}）"

@@ -10,19 +10,48 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+from collections.abc import AsyncGenerator
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, TypedDict, cast
 
 from astrbot.api import llm_tool, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import (
+    AstrMessageEvent,
+    MessageChain,
+    MessageEventResult,
+    filter,
+)
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.db.po import CronJob
 
 from .sources import AlbumInfo, select_source
 
 PLUGIN_NAME = "astrbot_plugin_daily_album"
 HISTORY_FILE = "album_history.json"
+
+
+class RecordDict(TypedDict):
+    """单条历史推荐记录（持久化形态）。"""
+
+    album_name: str
+    artist: list[str]
+    year: str
+    genre: list[str]
+    cover_url: str
+    description: str
+    listen_tip: str
+    date: str
+    timestamp: str
+
+
+class HistoryDict(TypedDict):
+    """`album_history.json` 的整体结构。"""
+
+    last_push_date: str
+    records: list[RecordDict]
+    seen_keys: list[str]
 
 
 def _dedup_key(album_name: str, artist: list[str]) -> str:
@@ -32,19 +61,19 @@ def _dedup_key(album_name: str, artist: list[str]) -> str:
 
 
 class DailyAlbumPlugin(Star):
-    def __init__(self, context: Context, config: dict):
+    def __init__(self, context: Context, config: dict[str, Any]) -> None:
         super().__init__(context)
-        self.config = config
+        self.config: dict[str, Any] = config
 
         self._data_dir: Path = StarTools.get_data_dir(PLUGIN_NAME)
         self._history_path: Path = self._data_dir / HISTORY_FILE
-        self._history: dict = self._load_history()
+        self._history: HistoryDict = self._load_history()
 
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock = asyncio.Lock()
         self._cron_job_id: str | None = None
-        self._cron_job_name = f"{PLUGIN_NAME}_daily"
+        self._cron_job_name: str = f"{PLUGIN_NAME}_daily"
 
-        self._init_task: asyncio.Task = asyncio.create_task(self._init())
+        self._init_task: asyncio.Task[None] = asyncio.create_task(self._init())
 
     @property
     def ctx(self) -> Context:
@@ -71,10 +100,13 @@ class DailyAlbumPlugin(Star):
     # 持久化
     # -------------------------------------------------------------------------
 
-    def _load_history(self) -> dict:
+    def _load_history(self) -> HistoryDict:
         if self._history_path.exists():
             try:
-                return json.loads(self._history_path.read_text(encoding="utf-8"))
+                raw: dict[str, Any] = json.loads(
+                    self._history_path.read_text(encoding="utf-8")
+                )
+                return cast(HistoryDict, raw)
             except Exception as e:
                 logger.warning(f"[DailyAlbum] 读取历史文件失败：{e}，使用空历史")
         return {"last_push_date": "", "records": [], "seen_keys": []}
@@ -92,17 +124,17 @@ class DailyAlbumPlugin(Star):
     # 定时任务
     # -------------------------------------------------------------------------
 
-    async def _list_own_jobs(self) -> list:
+    async def _list_own_jobs(self) -> list[CronJob]:
         """列出所有 name 等于本插件常量的 basic job。"""
         try:
-            jobs = await self.ctx.cron_manager.list_jobs("basic")
+            jobs: list[CronJob] = await self.ctx.cron_manager.list_jobs("basic")
         except Exception as e:
             logger.warning(f"[DailyAlbum] 列出 cron job 失败：{e}")
             return []
         return [j for j in jobs if getattr(j, "name", None) == self._cron_job_name]
 
     async def _setup_cron(self) -> None:
-        push_time = self.config.get("push_time", "10:00")
+        push_time: str = self.config.get("push_time", "10:00")
         try:
             hour_str, minute_str = push_time.split(":")
             hour, minute = int(hour_str), int(minute_str)
@@ -111,9 +143,9 @@ class DailyAlbumPlugin(Star):
                 f"[DailyAlbum] push_time 格式无效：{push_time!r}，使用 10:00"
             )
             hour, minute = 10, 0
-        cron_expression = f"{minute} {hour} * * *"
+        cron_expression: str = f"{minute} {hour} * * *"
 
-        existing = await self._list_own_jobs()
+        existing: list[CronJob] = await self._list_own_jobs()
 
         # 幂等复用：恰好一个、cron 一致、启用中 → 直接复用
         if (
@@ -121,7 +153,7 @@ class DailyAlbumPlugin(Star):
             and existing[0].cron_expression == cron_expression
             and existing[0].enabled
         ):
-            job = existing[0]
+            job: CronJob = existing[0]
             manager = self.ctx.cron_manager
             # handler 存在 CronJobManager._basic_handlers 里，按 job_id 索引；
             # reload / 进程重启后新实例的 handler 方法地址会变，需要重绑。
@@ -156,22 +188,23 @@ class DailyAlbumPlugin(Star):
         self._cron_job_id = None
 
         try:
-            job = await self.ctx.cron_manager.add_basic_job(
+            new_job: CronJob = await self.ctx.cron_manager.add_basic_job(
                 name=self._cron_job_name,
                 cron_expression=cron_expression,
                 handler=self._daily_handler,
                 description="每日专辑推荐",
                 persistent=False,
             )
-            self._cron_job_id = job.job_id
+            self._cron_job_id = new_job.job_id
             logger.info(
-                f"[DailyAlbum] 定时任务已注册，时间={hour:02d}:{minute:02d}，job_id={job.job_id}"
+                f"[DailyAlbum] 定时任务已注册，时间={hour:02d}:{minute:02d}，"
+                f"job_id={new_job.job_id}"
             )
         except Exception as e:
             logger.error(f"[DailyAlbum] 注册定时任务失败：{e}")
 
-    async def _daily_handler(self, **_kwargs) -> None:
-        today = datetime.now().strftime("%Y-%m-%d")
+    async def _daily_handler(self, **_kwargs: Any) -> None:
+        today: str = datetime.now().strftime("%Y-%m-%d")
         if self._history.get("last_push_date") == today:
             logger.info("[DailyAlbum] 今日已推送，跳过（防重启重复）")
             return
@@ -183,8 +216,8 @@ class DailyAlbumPlugin(Star):
 
     async def _run_recommend(self) -> None:
         async with self._lock:
-            records = self._history.get("records", [])
-            history_list = [
+            records: list[RecordDict] = self._history.get("records", [])
+            history_list: list[AlbumInfo] = [
                 AlbumInfo(
                     album_name=r["album_name"],
                     artist=r["artist"],
@@ -198,22 +231,24 @@ class DailyAlbumPlugin(Star):
             ]
             seen_keys: set[str] = set(self._history.get("seen_keys", []))
 
-            prompt = self.config.get(
+            prompt: str = self.config.get(
                 "recommend_prompt",
                 "请推荐一张值得深度聆听的经典或当代优秀专辑，涵盖各种音乐风格，注重艺术性和可听性。",
             )
 
             # 去重重试：rejected 列表追加到 history 末尾，让模型看到刚才被拒的专辑
-            MAX_RETRIES = 3
-            album = None
+            MAX_RETRIES: int = 3
+            album: AlbumInfo | None = None
             rejected: list[AlbumInfo] = []
             for attempt in range(1, MAX_RETRIES + 1):
                 source = select_source(self.ctx, self.config)
-                candidate = await source.fetch(prompt, history_list + rejected)
+                candidate: AlbumInfo | None = await source.fetch(
+                    prompt, history_list + rejected
+                )
                 if not candidate:
                     logger.error("[DailyAlbum] 来源未能返回有效专辑，本次跳过")
                     return
-                key = _dedup_key(candidate.album_name, candidate.artist)
+                key: str = _dedup_key(candidate.album_name, candidate.artist)
                 if key not in seen_keys:
                     album = candidate
                     break
@@ -229,15 +264,18 @@ class DailyAlbumPlugin(Star):
                 )
                 return
 
-            today = datetime.now().strftime("%Y-%m-%d")
-            key = _dedup_key(album.album_name, album.artist)
-            record = {
-                **asdict(album),
-                "date": today,
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-            }
+            today: str = datetime.now().strftime("%Y-%m-%d")
+            final_key: str = _dedup_key(album.album_name, album.artist)
+            record: RecordDict = cast(
+                RecordDict,
+                {
+                    **asdict(album),
+                    "date": today,
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                },
+            )
             self._history.setdefault("records", []).append(record)
-            self._history.setdefault("seen_keys", []).append(key)
+            self._history.setdefault("seen_keys", []).append(final_key)
             self._history["last_push_date"] = today
             self._save_history()
 
@@ -253,22 +291,24 @@ class DailyAlbumPlugin(Star):
             return ""
 
         # 解析该会话当前生效的人格
-        cid = await self.ctx.conversation_manager.get_curr_conversation_id(umo)
-        conv_persona_id = None
+        cid: str | None = await self.ctx.conversation_manager.get_curr_conversation_id(
+            umo
+        )
+        conv_persona_id: str | None = None
         if cid:
             conv = await self.ctx.conversation_manager.get_conversation(umo, cid)
             if conv:
                 conv_persona_id = getattr(conv, "persona_id", None)
-        platform_name = umo.split(":", 1)[0]
+        platform_name: str = umo.split(":", 1)[0]
         _, persona, _, _ = await self.ctx.persona_manager.resolve_selected_persona(
             umo=umo,
             conversation_persona_id=conv_persona_id,
             platform_name=platform_name,
         )
-        persona_prompt = (persona or {}).get("prompt", "")
+        persona_prompt: str = (persona or {}).get("prompt", "")
 
-        album_json = json.dumps(asdict(album), ensure_ascii=False)
-        prompt = (
+        album_json: str = json.dumps(asdict(album), ensure_ascii=False)
+        prompt: str = (
             f"以下是今日推荐的专辑信息（JSON）：\n{album_json}\n\n"
             "请用你自己的风格写一段今日专辑推荐文案，要自然、有感染力，"
             "不要逐字复述字段，像是在跟朋友分享, 但是可以自然地说明包含发行时间, 风格等信息。直接输出文案，不要加任何前缀或解释。"
@@ -285,16 +325,16 @@ class DailyAlbumPlugin(Star):
             return ""
 
     async def _build_chain(self, album: AlbumInfo, umo: str) -> MessageChain:
-        text = await self._generate_text(album, umo)
+        text: str = await self._generate_text(album, umo)
         if not text:
-            today = datetime.now().strftime("%Y年%m月%d日")
-            lines = [
+            today: str = datetime.now().strftime("%Y年%m月%d日")
+            lines: list[str] = [
                 f"今日专辑推荐 | {today}",
                 "",
                 f"{album.album_name}  {' / '.join(album.artist)}",
             ]
             text = "\n".join(lines)
-        chain = MessageChain()
+        chain: MessageChain = MessageChain()
         chain.message(text)
         return chain
 
@@ -319,7 +359,7 @@ class DailyAlbumPlugin(Star):
                 ),
                 system_prompt="你是音乐数据核验助手，只输出 yes 或 no，不输出任何其他内容。",
             )
-            answer = resp.completion_text.strip().lower()
+            answer: str = resp.completion_text.strip().lower()
             logger.debug(f"[DailyAlbum] LLM 核验结果：{answer!r}")
             return answer.startswith("y")
         except Exception as e:
@@ -332,11 +372,11 @@ class DailyAlbumPlugin(Star):
         """搜索网易云专辑，返回专辑第一首歌的歌曲 ID；失败返回 None"""
         import aiohttp
 
-        max_attempts = int(self.config.get("netease_search_max_attempts", 3))
-        timeout = aiohttp.ClientTimeout(total=8)
+        max_attempts: int = int(self.config.get("netease_search_max_attempts", 3))
+        timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=8)
 
         # 依次尝试的关键词：先"专辑名 艺术家"，再纯"专辑名"
-        keywords = [f"{album_name} {' '.join(artist)}", album_name]
+        keywords: list[str] = [f"{album_name} {' '.join(artist)}", album_name]
 
         try:
             async with aiohttp.ClientSession(cookies={"appver": "2.0.2"}) as session:
@@ -351,9 +391,11 @@ class DailyAlbumPlugin(Star):
                         },
                         timeout=timeout,
                     ) as resp:
-                        data = await resp.json(content_type=None)
+                        data: dict[str, Any] = await resp.json(content_type=None)
 
-                    albums = data.get("result", {}).get("albums", [])
+                    albums: list[dict[str, Any]] = data.get("result", {}).get(
+                        "albums", []
+                    )
                     if not albums:
                         logger.warning(
                             f"[DailyAlbum] 网易云专辑搜索无结果，keyword={keyword!r}"
@@ -361,15 +403,16 @@ class DailyAlbumPlugin(Star):
                         continue
 
                     for i, album in enumerate(albums):
-                        album_id = album["id"]
-                        album_title = album.get("name", "")
-                        album_artist = album.get("artist", {}).get("name", "")
+                        album_id: int = album["id"]
+                        album_title: str = album.get("name", "")
+                        album_artist: str = album.get("artist", {}).get("name", "")
                         logger.info(
-                            f"[DailyAlbum] 候选专辑 [{i + 1}/{len(albums)}]（keyword={keyword!r}）"
+                            f"[DailyAlbum] 候选专辑 [{i + 1}/{len(albums)}]"
+                            f"（keyword={keyword!r}）"
                             f" ID={album_id}，名称={album_title!r}，艺术家={album_artist!r}"
                         )
 
-                        matched = await self._is_target_album(
+                        matched: bool = await self._is_target_album(
                             album_title, album_artist, album_name, artist
                         )
                         if not matched:
@@ -380,23 +423,27 @@ class DailyAlbumPlugin(Star):
                             f"http://music.163.com/api/album/{album_id}",
                             timeout=timeout,
                         ) as resp:
-                            detail = await resp.json(content_type=None)
+                            detail: dict[str, Any] = await resp.json(content_type=None)
 
-                        songs = detail.get("album", {}).get("songs", [])
+                        songs: list[dict[str, Any]] = detail.get("album", {}).get(
+                            "songs", []
+                        )
                         if not songs:
                             logger.warning(
                                 f"[DailyAlbum] 专辑 {album_id} 歌曲列表为空，继续尝试"
                             )
                             continue
 
-                        sid = str(songs[0]["id"])
+                        sid: str = str(songs[0]["id"])
                         logger.info(
-                            f"[DailyAlbum] 取专辑第一首歌 ID={sid}，歌名={songs[0].get('name', '')!r}"
+                            f"[DailyAlbum] 取专辑第一首歌 ID={sid}，"
+                            f"歌名={songs[0].get('name', '')!r}"
                         )
                         return sid
 
                     logger.warning(
-                        f"[DailyAlbum] keyword={keyword!r} 的 {len(albums)} 条候选均未通过核验，尝试下一关键词"
+                        f"[DailyAlbum] keyword={keyword!r} 的 {len(albums)} 条候选"
+                        "均未通过核验，尝试下一关键词"
                     )
 
                 logger.warning("[DailyAlbum] 所有关键词均未找到匹配专辑，放弃")
@@ -410,7 +457,7 @@ class DailyAlbumPlugin(Star):
         from astrbot.core.platform.message_type import MessageType
 
         try:
-            session = MessageSession.from_str(session_str)
+            session: MessageSession = MessageSession.from_str(session_str)
         except Exception:
             return
 
@@ -425,7 +472,7 @@ class DailyAlbumPlugin(Star):
         if bot is None:
             return
 
-        payload = {
+        payload: dict[str, Any] = {
             "message": [{"type": "music", "data": {"type": "163", "id": song_id}}]
         }
         try:
@@ -449,11 +496,13 @@ class DailyAlbumPlugin(Star):
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
             return
 
-        song_id = await self._search_netease_song_id(album.album_name, album.artist)
-        chain = await self._build_chain(album, sessions[0])
-        hint_chain = None
+        song_id: str | None = await self._search_netease_song_id(
+            album.album_name, album.artist
+        )
+        chain: MessageChain = await self._build_chain(album, sessions[0])
+        hint_chain: MessageChain | None = None
         if not song_id:
-            hint = await self._generate_not_found_hint(
+            hint: str = await self._generate_not_found_hint(
                 album.album_name, album.artist, sessions[0]
             )
             hint_chain = MessageChain().message(hint)
@@ -476,7 +525,7 @@ class DailyAlbumPlugin(Star):
         self, album_name: str, artist: list[str], umo: str
     ) -> str:
         provider = self.ctx.get_using_provider()
-        fallback = (
+        fallback: str = (
             f"\n未能在网易云找到「{album_name}」，"
             "可以去 Spotify / Apple Music / 网易云 / BandCamp 手动搜索哦～"
         )
@@ -487,7 +536,7 @@ class DailyAlbumPlugin(Star):
             conversation_persona_id=None,
             platform_name=umo.split(":", 1)[0],
         )
-        persona_prompt = (persona or {}).get("prompt", "")
+        persona_prompt: str = (persona or {}).get("prompt", "")
         try:
             resp = await self.ctx.llm_generate(
                 chat_provider_id=provider.meta().id,
@@ -516,10 +565,10 @@ class DailyAlbumPlugin(Star):
             conversation_persona_id=None,
             platform_name=umo.split(":", 1)[0],
         )
-        persona_prompt = (persona or {}).get("prompt", "")
+        persona_prompt: str = (persona or {}).get("prompt", "")
         try:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            action = random.choice(
+            now: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            action: str = random.choice(
                 [
                     "正在翻找今日值得一听的专辑",
                     "在音乐库里帮你挑一张好专辑",
@@ -528,7 +577,7 @@ class DailyAlbumPlugin(Star):
                     "稍微想了想，正在为你选一张专辑",
                 ]
             )
-            wait = random.choice(
+            wait: str = random.choice(
                 [
                     "稍等一下",
                     "请稍候",
@@ -537,7 +586,7 @@ class DailyAlbumPlugin(Star):
                     "等一下下",
                 ]
             )
-            style = random.choice(
+            style: str = random.choice(
                 [
                     "用你自己的风格说这件事",
                     "随性地表达",
@@ -545,7 +594,7 @@ class DailyAlbumPlugin(Star):
                     "用你惯常的口吻说",
                 ]
             )
-            prompt = (
+            prompt: str = (
                 f"现在是 {now}。{action}，需要让用户{wait}。"
                 f"请{style}，直接输出这句话，不要加任何前缀或解释。"
                 f"不要在这一部分推荐任何音乐"
@@ -560,14 +609,16 @@ class DailyAlbumPlugin(Star):
             return "正在生成今日专辑推荐，请稍候..."
 
     @filter.command("album_today")
-    async def cmd_today(self, event: AstrMessageEvent):
+    async def cmd_today(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
         """手动触发，推送到当前会话；可附带参数覆盖推荐偏好，如 /album_today 推荐一张emo专辑"""
-        waiting = await self._generate_waiting_text(event.unified_msg_origin)
+        waiting: str = await self._generate_waiting_text(event.unified_msg_origin)
         yield event.plain_result(waiting)
-        original_sessions = list(self.config.get("target_sessions", []))
-        original_prompt = self.config.get("recommend_prompt")
+        original_sessions: list[str] = list(self.config.get("target_sessions", []))
+        original_prompt: str | None = self.config.get("recommend_prompt")
         # 命令后的文本作为临时 prompt
-        custom_prompt = event.message_str.removeprefix("album_today").strip()
+        custom_prompt: str = event.message_str.removeprefix("album_today").strip()
         self.config["target_sessions"] = [event.unified_msg_origin]
         if custom_prompt:
             self.config["recommend_prompt"] = custom_prompt
@@ -583,14 +634,16 @@ class DailyAlbumPlugin(Star):
         event.stop_event()
 
     @llm_tool("recommend_album")
-    async def tool_recommend_album(self, event: AstrMessageEvent, prompt: str = "") -> None:
+    async def tool_recommend_album(
+        self, event: AstrMessageEvent, prompt: str = ""
+    ) -> None:
         """推荐一张专辑并发送到当前会话。当用户希望获得音乐或专辑推荐时调用此工具。
 
         Args:
             prompt(string): 可选。描述期望的专辑风格、流派、情绪或年代等偏好。留空则使用默认推荐偏好。
         """
-        original_sessions = list(self.config.get("target_sessions", []))
-        original_prompt = self.config.get("recommend_prompt")
+        original_sessions: list[str] = list(self.config.get("target_sessions", []))
+        original_prompt: str | None = self.config.get("recommend_prompt")
         self.config["target_sessions"] = [event.unified_msg_origin]
         if prompt:
             self.config["recommend_prompt"] = prompt
@@ -605,13 +658,15 @@ class DailyAlbumPlugin(Star):
                     self.config["recommend_prompt"] = original_prompt
 
     @filter.command("album_history")
-    async def cmd_history(self, event: AstrMessageEvent):
+    async def cmd_history(
+        self, event: AstrMessageEvent
+    ) -> AsyncGenerator[MessageEventResult, None]:
         """查看最近 10 条推荐历史"""
-        records = self._history.get("records", [])[-10:]
+        records: list[RecordDict] = self._history.get("records", [])[-10:]
         if not records:
             yield event.plain_result("还没有推荐记录。")
             return
-        lines = ["最近推荐："] + [
+        lines: list[str] = ["最近推荐："] + [
             f"{r['date']}  {r['album_name']} / {r['artist']}" for r in records
         ]
         yield event.plain_result("\n".join(lines))

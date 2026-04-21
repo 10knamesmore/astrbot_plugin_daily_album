@@ -5,22 +5,28 @@ import importlib
 import importlib.util
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import fields
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
 
 from .base import AlbumInfo, AlbumSource
 
-_REQUIRED = {"album_name", "artist"}
-_ALLOWED = {f.name for f in fields(AlbumInfo)}
+_REQUIRED: set[str] = {"album_name", "artist"}
+_ALLOWED: set[str] = {f.name for f in fields(AlbumInfo)}
+
+
+# 用户脚本必须实现的函数签名
+ScriptFetchFn = Callable[[str, list[dict[str, Any]]], Awaitable[dict[str, Any]]]
 
 
 def _extract_requirements(script_path: str) -> list[str]:
     """静态解析脚本，提取顶层 REQUIREMENTS 列表，失败返回空列表。"""
     try:
-        source = Path(script_path).read_text(encoding="utf-8")
-        tree = ast.parse(source)
+        source: str = Path(script_path).read_text(encoding="utf-8")
+        tree: ast.Module = ast.parse(source)
     except Exception:
         return []
 
@@ -45,14 +51,21 @@ def _ensure_requirements(requirements: list[str]) -> None:
     """检查并安装缺失的依赖包。"""
     for req in requirements:
         # 取包名部分（去掉版本约束）用于 import 检测
-        pkg = req.split("==")[0].split(">=")[0].split("<=")[0].split("!=")[0].split("~=")[0].strip()
+        pkg: str = (
+            req.split("==")[0]
+            .split(">=")[0]
+            .split("<=")[0]
+            .split("!=")[0]
+            .split("~=")[0]
+            .strip()
+        )
         # 包名可能含连字符（install 用 foo-bar，import 用 foo_bar）
-        import_name = pkg.replace("-", "_")
+        import_name: str = pkg.replace("-", "_")
         try:
             importlib.import_module(import_name)
         except ImportError:
             logger.info(f"[DailyAlbum] 安装依赖：{req}")
-            result = subprocess.run(
+            result: subprocess.CompletedProcess[str] = subprocess.run(
                 [sys.executable, "-m", "pip", "install", req],
                 capture_output=True,
                 text=True,
@@ -66,8 +79,8 @@ def _ensure_requirements(requirements: list[str]) -> None:
 
 
 class ScriptSource(AlbumSource):
-    def __init__(self, config: dict) -> None:
-        self._config = config
+    def __init__(self, config: dict[str, Any]) -> None:
+        self._config: dict[str, Any] = config
 
     @property
     def source_name(self) -> str:
@@ -78,19 +91,23 @@ class ScriptSource(AlbumSource):
         prompt: str,
         history: list[AlbumInfo],
     ) -> AlbumInfo | None:
-        files: list = self._config.get("source_script", {}).get("script_file", [])
-        script_path = files[0].strip() if files else ""
+        files: list[str] = self._config.get("source_script", {}).get("script_file", [])
+        script_path: str = files[0].strip() if files else ""
         if not script_path:
             logger.error("[DailyAlbum] 未上传自定义脚本文件")
             return None
 
         # 安装脚本声明的外部依赖
-        requirements = _extract_requirements(script_path)
+        requirements: list[str] = _extract_requirements(script_path)
         if requirements:
             _ensure_requirements(requirements)
 
         try:
-            spec = importlib.util.spec_from_file_location("_daily_album_script", script_path)
+            spec: importlib.machinery.ModuleSpec | None = (
+                importlib.util.spec_from_file_location(
+                    "_daily_album_script", script_path
+                )
+            )
             if spec is None or spec.loader is None:
                 logger.error(f"[DailyAlbum] 无法加载脚本：{script_path}")
                 return None
@@ -100,18 +117,17 @@ class ScriptSource(AlbumSource):
             logger.error(f"[DailyAlbum] 加载脚本失败：{e}")
             return None
 
-        fetch_fn = getattr(module, "fetch_album", None)
+        fetch_fn: ScriptFetchFn | None = getattr(module, "fetch_album", None)
         if fetch_fn is None:
             logger.error(f"[DailyAlbum] 脚本 {script_path} 中未找到 fetch_album 函数")
             return None
 
-        history_dicts = [
-            {f.name: getattr(a, f.name) for f in fields(AlbumInfo)}
-            for a in history
+        history_dicts: list[dict[str, Any]] = [
+            {f.name: getattr(a, f.name) for f in fields(AlbumInfo)} for a in history
         ]
 
         try:
-            result = await fetch_fn(prompt, history_dicts)
+            result: dict[str, Any] = await fetch_fn(prompt, history_dicts)
         except Exception as e:
             logger.error(f"[DailyAlbum] 脚本 fetch_album 抛出异常：{e}")
             return None
@@ -120,17 +136,17 @@ class ScriptSource(AlbumSource):
             logger.error(f"[DailyAlbum] 脚本返回值不是 dict：{type(result)}")
             return None
 
-        missing = _REQUIRED - result.keys()
+        missing: set[str] = _REQUIRED - result.keys()
         if missing:
             logger.error(f"[DailyAlbum] 脚本返回值缺少必填字段：{missing}")
             return None
 
-        _LIST_FIELDS = {"artist", "genre"}
-        kwargs: dict = {}
+        list_fields: set[str] = {"artist", "genre"}
+        kwargs: dict[str, str | list[str]] = {}
         for k, v in result.items():
             if k not in _ALLOWED:
                 continue
-            if k in _LIST_FIELDS:
+            if k in list_fields:
                 kwargs[k] = [str(v)] if isinstance(v, str) else [str(x) for x in v]
             else:
                 kwargs[k] = str(v)

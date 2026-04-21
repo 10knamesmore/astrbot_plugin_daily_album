@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from astrbot.api import logger
+from astrbot.api.provider import LLMResponse
+from astrbot.api.star import Context
 
 
-async def extract_search_query(context, prompt: str) -> str:
+async def extract_search_query(context: Context, prompt: str) -> str:
     """用 LLM 从推荐提示词中提炼出适合搜索引擎的关键词短语。"""
     provider = context.get_using_provider()
     if not provider:
@@ -11,7 +13,7 @@ async def extract_search_query(context, prompt: str) -> str:
         return prompt
 
     try:
-        resp = await context.llm_generate(
+        resp: LLMResponse = await context.llm_generate(
             chat_provider_id=provider.meta().id,
             prompt=(
                 f"以下是一段专辑推荐需求描述：\n{prompt}\n\n"
@@ -20,7 +22,7 @@ async def extract_search_query(context, prompt: str) -> str:
             ),
             system_prompt="你是搜索关键词提取助手，只输出关键词，不输出任何解释。",
         )
-        keywords = resp.completion_text.strip()
+        keywords: str = resp.completion_text.strip()
         logger.debug(f"[DailyAlbum] 关键词提取结果：{keywords!r}")
         return keywords
     except Exception as e:

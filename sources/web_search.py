@@ -1,21 +1,32 @@
 from __future__ import annotations
 
+from typing import Any, TypedDict
+
 import aiohttp
 
 from astrbot.api import logger
+from astrbot.api.star import Context
 
 from .base import AlbumInfo, AlbumSource
 from .llm import LLMSource
 from .query_extractor import extract_search_query
 
-_SEARCH_TIMEOUT = aiohttp.ClientTimeout(total=15)
+_SEARCH_TIMEOUT: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=15)
+
+
+class SearchResult(TypedDict):
+    """统一的搜索结果条目结构。"""
+
+    title: str
+    url: str
+    content: str
 
 
 class WebSearchSource(AlbumSource):
-    def __init__(self, context, config: dict) -> None:
-        self._context = context
-        self._config = config
-        self._llm = LLMSource(context, config)
+    def __init__(self, context: Context, config: dict[str, Any]) -> None:
+        self._context: Context = context
+        self._config: dict[str, Any] = config
+        self._llm: LLMSource = LLMSource(context, config)
 
     @property
     def source_name(self) -> str:
@@ -26,19 +37,19 @@ class WebSearchSource(AlbumSource):
         prompt: str,
         history: list[AlbumInfo],
     ) -> AlbumInfo | None:
-        snippets = await self._search(prompt)
+        snippets: str = await self._search(prompt)
         return await self._llm.fetch(prompt, history, search_snippets=snippets)
 
     async def _search(self, prompt: str) -> str:
         """搜索并返回拼接好的文本片段，失败时返回空字符串"""
-        keywords = await extract_search_query(self._context, prompt)
-        query = f"专辑推荐 {keywords}"
+        keywords: str = await extract_search_query(self._context, prompt)
+        query: str = f"专辑推荐 {keywords}"
         logger.info(f"[DailyAlbum] 开始联网搜索，query={query!r}...")
 
-        results: list[dict] = []
+        results: list[SearchResult] = []
 
         # 1. 尝试 Tavily
-        tavily_key = self._get_tavily_key()
+        tavily_key: str = self._get_tavily_key()
         if tavily_key:
             logger.debug("[DailyAlbum] 使用 Tavily 搜索")
             try:
@@ -62,22 +73,24 @@ class WebSearchSource(AlbumSource):
             logger.warning("[DailyAlbum] 联网搜索无结果，将不附加参考信息")
             return "（未获取联网信息）"
 
-        lines = []
+        lines: list[str] = []
         for r in results[:5]:
-            title = r.get("title", "")
-            url = r.get("url", "")
-            content = r.get("content", r.get("snippet", ""))[:300]
+            title: str = r.get("title", "")
+            url: str = r.get("url", "")
+            content: str = r.get("content", "")[:300]
             if title or content:
                 lines.append(f"【{title}】\n{content}")
                 logger.info(f"[DailyAlbum] 采用搜索结果：{title!r}  {url}")
-        snippets = "\n\n".join(lines) if lines else "（未获取联网信息）"
+        snippets: str = "\n\n".join(lines) if lines else "（未获取联网信息）"
         logger.debug(f"[DailyAlbum] 搜索片段长度：{len(snippets)} 字")
         return snippets
 
     def _get_tavily_key(self) -> str:
         try:
-            cfg = self._context.get_config()
-            keys = cfg.get("provider_settings", {}).get("websearch_tavily_key", [])
+            cfg: dict[str, Any] = self._context.get_config()
+            keys: str | list[str] = cfg.get("provider_settings", {}).get(
+                "websearch_tavily_key", []
+            )
             if isinstance(keys, str):
                 return keys.strip()
             if isinstance(keys, list) and keys:
@@ -86,9 +99,9 @@ class WebSearchSource(AlbumSource):
             pass
         return ""
 
-    async def _search_tavily(self, query: str, api_key: str) -> list[dict]:
+    async def _search_tavily(self, query: str, api_key: str) -> list[SearchResult]:
         async with aiohttp.ClientSession() as session:
-            payload = {
+            payload: dict[str, Any] = {
                 "api_key": api_key,
                 "query": query,
                 "search_depth": "basic",
@@ -99,17 +112,17 @@ class WebSearchSource(AlbumSource):
                 json=payload,
                 timeout=_SEARCH_TIMEOUT,
             ) as resp:
-                data = await resp.json()
+                data: dict[str, Any] = await resp.json()
                 return [
-                    {
-                        "title": r.get("title", ""),
-                        "url": r.get("url", ""),
-                        "content": r.get("content", ""),
-                    }
+                    SearchResult(
+                        title=r.get("title", ""),
+                        url=r.get("url", ""),
+                        content=r.get("content", ""),
+                    )
                     for r in data.get("results", [])
                 ]
 
-    async def _search_bing(self, query: str) -> list[dict]:
+    async def _search_bing(self, query: str) -> list[SearchResult]:
         from urllib.parse import quote
 
         try:
@@ -118,7 +131,7 @@ class WebSearchSource(AlbumSource):
             logger.warning("[DailyAlbum] BeautifulSoup 未安装，跳过 Bing 搜索")
             return []
 
-        headers = {
+        headers: dict[str, str] = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -126,28 +139,29 @@ class WebSearchSource(AlbumSource):
             ),
             "Accept-Language": "zh-CN,zh;q=0.9",
         }
-        url = f"https://cn.bing.com/search?q={quote(query)}&mkt=zh-CN"
+        url: str = f"https://cn.bing.com/search?q={quote(query)}&mkt=zh-CN"
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 url,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
-                html = await resp.text()
+                html: str = await resp.text()
 
-        soup = BeautifulSoup(html, "html.parser")
-        results = []
+        soup: BeautifulSoup = BeautifulSoup(html, "html.parser")
+        results: list[SearchResult] = []
         for item in soup.select("li.b_algo")[:5]:
             title_el = item.select_one("h2 a")
             snippet_el = item.select_one(".b_caption p")
             if title_el:
+                href = title_el.get("href", "")
                 results.append(
-                    {
-                        "title": title_el.get_text(strip=True),
-                        "url": title_el.get("href", ""),
-                        "content": snippet_el.get_text(strip=True)
-                        if snippet_el
-                        else "",
-                    }
+                    SearchResult(
+                        title=title_el.get_text(strip=True),
+                        url=str(href) if href else "",
+                        content=(
+                            snippet_el.get_text(strip=True) if snippet_el else ""
+                        ),
+                    )
                 )
         return results

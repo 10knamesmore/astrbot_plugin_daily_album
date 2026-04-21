@@ -1,7 +1,11 @@
-REQUIREMENTS = []
+from __future__ import annotations
+
+from typing import Any
+
+REQUIREMENTS: list[str] = []
 
 
-async def fetch_album(prompt: str, history: list[dict]) -> dict:
+async def fetch_album(prompt: str, history: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "album_name": "Kind of Blue",
         "artist": ["Miles Davis"],
