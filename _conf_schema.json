@@ -91,11 +91,5 @@
     "description": "把每日推荐写入会话历史",
     "hint": "启用后，每次推送会以 (用户提问/助手回答) 的形式追加到目标 session 的对话历史，方便 LLM 后续被问起时引用。tool_call 路径会自动跳过避免重复。",
     "default": true
-  },
-  "telegram_include_netease_url": {
-    "type": "bool",
-    "description": "Telegram 平台是否在文案后追加网易云链接",
-    "hint": "启用后，发往 Telegram 的推荐文案会附带 https://music.163.com/song?id=xxx 链接，TG 客户端会尝试 unfurl 成卡片。",
-    "default": true
   }
 }

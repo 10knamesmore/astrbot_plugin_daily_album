@@ -23,24 +23,17 @@ class TelegramSender(AlbumSender):
         return "telegram"
 
     async def send(self, sctx: SendContext) -> SendResult:
-        include_url: bool = bool(
-            sctx.config.get("telegram_include_netease_url", True)
-        )
-
         # 拼装尾部内容：网易云链接（找到时） / fallback 提示（找不到时）
         suffix: str
-        if sctx.netease_song_id and include_url:
+        if sctx.netease_song_id:
             suffix = "\n\n" + NETEASE_SONG_URL_TEMPLATE.format(
                 song_id=sctx.netease_song_id
             )
-        elif not sctx.netease_song_id:
+        else:
             hint: str = await self.generate_not_found_hint(
                 sctx, default_hint=DEFAULT_NOT_FOUND_HINT
             )
             suffix = "\n\n" + hint
-        else:
-            # 用户关掉了 URL 注入且找到了 song_id：什么都不追加
-            suffix = ""
 
         full_text: str = sctx.recommend_text + suffix
         try:
