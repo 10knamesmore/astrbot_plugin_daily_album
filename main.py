@@ -19,14 +19,15 @@ from typing import Any, TypedDict, cast
 from astrbot.api import llm_tool, logger
 from astrbot.api.event import (
     AstrMessageEvent,
-    MessageChain,
     MessageEventResult,
     filter,
 )
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.db.po import CronJob
 
+from .senders import SendContext, select_sender
 from .sources import AlbumInfo, select_source
+from .utils.netease import search_netease_song_id
 
 PLUGIN_NAME = "astrbot_plugin_daily_album"
 HISTORY_FILE = "album_history.json"
@@ -337,206 +338,75 @@ class DailyAlbumPlugin(Star):
             text = "\n".join(lines)
         return text
 
-    async def _is_target_album(
-        self,
-        candidate_name: str,
-        candidate_artist: str,
-        target_name: str,
-        target_artist: list[str],
-    ) -> bool:
-        """用 LLM 判断搜索结果是否是目标专辑，返回 True/False。"""
-        provider = self.ctx.get_using_provider()
-        if not provider:
-            return True  # 无 LLM 时直接信任第一个结果
-        try:
-            resp = await self.ctx.llm_generate(
-                chat_provider_id=provider.meta().id,
-                prompt=(
-                    f"目标专辑：《{target_name}》，艺术家：{', '.join(target_artist)}\n"
-                    f"搜索结果：《{candidate_name}》，艺术家：{candidate_artist}\n\n"
-                    "判断搜索结果是否是目标专辑（同一张专辑的 Deluxe Edition、Remastered、Anniversary Edition 等版本均视为匹配）。只回答 yes 或 no。"
-                ),
-                system_prompt="你是音乐数据核验助手，只输出 yes 或 no，不输出任何其他内容。",
-            )
-            answer: str = resp.completion_text.strip().lower()
-            logger.debug(f"[DailyAlbum] LLM 核验结果：{answer!r}")
-            return answer.startswith("y")
-        except Exception as e:
-            logger.warning(f"[DailyAlbum] LLM 核验失败，信任当前结果：{e}")
-            return True
-
-    async def _search_netease_song_id(
-        self, album_name: str, artist: list[str]
-    ) -> str | None:
-        """搜索网易云专辑，返回专辑第一首歌的歌曲 ID；失败返回 None"""
-        import aiohttp
-
-        max_attempts: int = int(self.config.get("netease_search_max_attempts", 3))
-        timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=8)
-
-        # 依次尝试的关键词：先"专辑名 艺术家"，再纯"专辑名"
-        keywords: list[str] = [f"{album_name} {' '.join(artist)}", album_name]
-
-        try:
-            async with aiohttp.ClientSession(cookies={"appver": "2.0.2"}) as session:
-                for keyword in keywords:
-                    async with session.post(
-                        "http://music.163.com/api/search/get/web",
-                        data={
-                            "s": keyword,
-                            "limit": max_attempts,
-                            "type": 10,
-                            "offset": 0,
-                        },
-                        timeout=timeout,
-                    ) as resp:
-                        data: dict[str, Any] = await resp.json(content_type=None)
-
-                    albums: list[dict[str, Any]] = data.get("result", {}).get(
-                        "albums", []
-                    )
-                    if not albums:
-                        logger.warning(
-                            f"[DailyAlbum] 网易云专辑搜索无结果，keyword={keyword!r}"
-                        )
-                        continue
-
-                    for i, album in enumerate(albums):
-                        album_id: int = album["id"]
-                        album_title: str = album.get("name", "")
-                        album_artist: str = album.get("artist", {}).get("name", "")
-                        logger.info(
-                            f"[DailyAlbum] 候选专辑 [{i + 1}/{len(albums)}]"
-                            f"（keyword={keyword!r}）"
-                            f" ID={album_id}，名称={album_title!r}，艺术家={album_artist!r}"
-                        )
-
-                        matched: bool = await self._is_target_album(
-                            album_title, album_artist, album_name, artist
-                        )
-                        if not matched:
-                            logger.info("[DailyAlbum] LLM 判定不匹配，跳过")
-                            continue
-
-                        async with session.get(
-                            f"http://music.163.com/api/album/{album_id}",
-                            timeout=timeout,
-                        ) as resp:
-                            detail: dict[str, Any] = await resp.json(content_type=None)
-
-                        songs: list[dict[str, Any]] = detail.get("album", {}).get(
-                            "songs", []
-                        )
-                        if not songs:
-                            logger.warning(
-                                f"[DailyAlbum] 专辑 {album_id} 歌曲列表为空，继续尝试"
-                            )
-                            continue
-
-                        sid: str = str(songs[0]["id"])
-                        logger.info(
-                            f"[DailyAlbum] 取专辑第一首歌 ID={sid}，"
-                            f"歌名={songs[0].get('name', '')!r}"
-                        )
-                        return sid
-
-                    logger.warning(
-                        f"[DailyAlbum] keyword={keyword!r} 的 {len(albums)} 条候选"
-                        "均未通过核验，尝试下一关键词"
-                    )
-
-                logger.warning("[DailyAlbum] 所有关键词均未找到匹配专辑，放弃")
-        except Exception as e:
-            logger.warning(f"[DailyAlbum] 网易云搜索失败：{e}")
-        return None
-
-    async def _send_music_card(self, session_str: str, song_id: str) -> None:
-        """发网易云音乐卡片（song_id 为歌曲 ID 字符串）"""
-        from astrbot.core.platform.message_session import MessageSession
-        from astrbot.core.platform.message_type import MessageType
-
-        try:
-            session: MessageSession = MessageSession.from_str(session_str)
-        except Exception:
-            return
-
-        platform = None
-        for p in self.ctx.platform_manager.platform_insts:
-            if p.meta().id == session.platform_name:
-                platform = p
-                break
-        if platform is None:
-            return
-        bot = getattr(platform, "bot", None)
-        if bot is None:
-            return
-
-        payload: dict[str, Any] = {
-            "message": [{"type": "music", "data": {"type": "163", "id": song_id}}]
-        }
-        try:
-            if session.message_type == MessageType.GROUP_MESSAGE:
-                await bot.api.call_action(
-                    "send_group_msg", group_id=int(session.session_id), **payload
-                )
-            else:
-                await bot.api.call_action(
-                    "send_private_msg", user_id=int(session.session_id), **payload
-                )
-            logger.info(
-                f"[DailyAlbum] 音乐卡片已发送：song_id={song_id} → {session_str}"
-            )
-        except Exception as e:
-            logger.warning(f"[DailyAlbum] 音乐卡片发送失败：{e}")
-
     async def _send_to_sessions(
         self, album: AlbumInfo, *, record_history: bool = True
     ) -> None:
+        """Per-session orchestrator：解析平台 → 生成文案 → 调 sender → 写历史。
+
+        网易云搜索在循环外做一次，结果广播给所有 sender；
+        每条 session 的文案 per-session 生成（人格化），互不影响。
+        """
         sessions: list[str] = self.config.get("target_sessions", [])
         if not sessions:
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
             return
 
-        song_id: str | None = await self._search_netease_song_id(
-            album.album_name, album.artist
+        # 所有 sender 共享的预查询：网易云首歌 ID（找不到为 None）
+        netease_song_id: str | None = await search_netease_song_id(
+            self.ctx, self.config, album.album_name, album.artist
         )
-        recommend_text: str = await self._build_text(album, sessions[0])
-        chain: MessageChain = MessageChain().message(recommend_text)
 
-        hint_text: str = ""
-        hint_chain: MessageChain | None = None
-        if not song_id:
-            hint_text = await self._generate_not_found_hint(
-                album.album_name, album.artist, sessions[0]
-            )
-            hint_chain = MessageChain().message(hint_text)
-
-        # 用户配置 + 调用方传入的开关都为真才写历史
         write_history: bool = record_history and bool(
             self.config.get("record_history", True)
         )
-        full_assistant_text: str = recommend_text + (
-            ("\n" + hint_text) if hint_text else ""
-        )
 
-        for session in sessions:
+        for session_str in sessions:
+            resolved = select_sender(self.ctx, session_str)
+            if resolved is None:
+                # warn 已在 select_sender 内部打印
+                continue
+            sender, platform, platform_type = resolved
+
+            recommend_text: str = await self._build_text(album, session_str)
+
+            sctx = SendContext(
+                album=album,
+                session_str=session_str,
+                platform=platform,
+                platform_type=platform_type,
+                recommend_text=recommend_text,
+                netease_song_id=netease_song_id,
+                config=self.config,
+                ctx=self.ctx,
+            )
+
             try:
-                await StarTools.send_message(session, chain)
-                if song_id:
-                    await self._send_music_card(session, song_id)
-                elif hint_chain:
-                    await asyncio.sleep(1)
-                    await StarTools.send_message(session, hint_chain)
-                logger.info(
-                    f"[DailyAlbum] 已推送到 {session}：{album.album_name} / {album.artist}"
-                )
-                if write_history:
-                    await self._record_to_history(
-                        session, album, full_assistant_text
-                    )
-                await asyncio.sleep(1)
+                result = await sender.send(sctx)
             except Exception as e:
-                logger.error(f"[DailyAlbum] 发送到 {session} 失败：{e}")
+                # sender 实现已自行兜底；这里防御式再 catch 一层
+                logger.error(
+                    f"[DailyAlbum] sender 未捕获异常 ({session_str}): {e}",
+                    exc_info=True,
+                )
+                continue
+
+            if not result.success:
+                logger.error(
+                    f"[DailyAlbum] 发送到 {session_str} 失败：{result.error}"
+                )
+                continue
+
+            logger.info(
+                f"[DailyAlbum] 已推送到 {session_str}（{platform_type}）："
+                f"{album.album_name} / {album.artist}"
+            )
+
+            if write_history:
+                await self._record_to_history(
+                    session_str, album, result.assistant_text_for_history
+                )
+
+            await asyncio.sleep(1)
 
     async def _record_to_history(
         self, umo: str, album: AlbumInfo, assistant_text: str
@@ -571,37 +441,6 @@ class DailyAlbumPlugin(Star):
             )
         except Exception as e:
             logger.warning(f"[DailyAlbum] 写入会话历史失败 ({umo}): {e}")
-
-    async def _generate_not_found_hint(
-        self, album_name: str, artist: list[str], umo: str
-    ) -> str:
-        provider = self.ctx.get_using_provider()
-        fallback: str = (
-            f"\n未能在网易云找到「{album_name}」，"
-            "可以去 Spotify / Apple Music / 网易云 / BandCamp 手动搜索哦～"
-        )
-        if not provider:
-            return fallback
-        _, persona, _, _ = await self.ctx.persona_manager.resolve_selected_persona(
-            umo=umo,
-            conversation_persona_id=None,
-            platform_name=umo.split(":", 1)[0],
-        )
-        persona_prompt: str = (persona or {}).get("prompt", "")
-        try:
-            resp = await self.ctx.llm_generate(
-                chat_provider_id=provider.meta().id,
-                prompt=(
-                    f"今日推荐的专辑是《{album_name}》，艺术家：{', '.join(artist)}。"
-                    "在网易云音乐上没有找到这张专辑。"
-                    "请用你自己的风格，告知用户没有找到, 可以去其他平台"
-                    "自行搜索的提示。直接输出这句话，不要加任何前缀或解释。"
-                ),
-                system_prompt=persona_prompt or "你是一个热爱音乐的推荐者。",
-            )
-            return "\n" + resp.completion_text.strip()
-        except Exception:
-            return fallback
 
     # -------------------------------------------------------------------------
     # 命令
