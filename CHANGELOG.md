@@ -3,6 +3,24 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [v0.0.8] - 2026-05-02
+
+修复 `recommend_album` 作为 LLM tool 调用时 120s 超时（[#1](https://github.com/10knamesmore/astrbot_plugin_daily_album/issues/1)）。
+
+### 修复
+- `recommend_album` 工具调用不再卡住 agent。AstrBot 对每个本地工具有 120s 硬超时，而推荐流水线（联网搜索 + LLM 抽取候选 + 文案生成）耗时常常贴近或超过这个上限。现在 tool 立即返回 ack 字符串，真正的推荐放到后台任务执行，由 sender 自己把专辑卡片送达会话。
+
+### 变更
+- 工具触发的推荐**会**写入会话历史（之前 `record_history=False` 跳过了，旧注释里"agent 会重复写"的假设并不成立——tool 返回 None 时 agent 历史里实际没有专辑信息）。后续被问到"刚才推荐的什么"时 LLM 能正确引用。
+- `_run_recommend` / `_send_to_sessions` 改为通过 `target_sessions` / `prompt_override` / `sessions_override` 传参覆盖，不再临时 mutate `self.config`。这同时消除了 tool 后台任务可能并发污染 config 的隐患。
+- 插件 `terminate()` 会取消正在跑的后台推荐任务，避免 reload / 关闭时留野协程。
+
+### 兼容性
+- 配置项不变。
+- `/album_today`、cron 推送行为不变。
+
+---
+
 ## [v0.0.7] - 2026-04-22
 
 发送侧重构，支持 Telegram 平台；新平台后续可低成本接入。
