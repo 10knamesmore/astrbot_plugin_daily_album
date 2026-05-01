@@ -74,6 +74,7 @@ class DailyAlbumPlugin(Star):
         self._cron_job_id: str | None = None
         self._cron_job_name: str = f"{PLUGIN_NAME}_daily"
 
+        self._bg_tasks: set[asyncio.Task[None]] = set()
         self._init_task: asyncio.Task[None] = asyncio.create_task(self._init())
 
     @property
@@ -96,6 +97,10 @@ class DailyAlbumPlugin(Star):
                 await self._init_task
             except (asyncio.CancelledError, Exception):
                 pass
+        for t in list(self._bg_tasks):
+            t.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
 
     # -------------------------------------------------------------------------
     # 持久化
@@ -215,7 +220,12 @@ class DailyAlbumPlugin(Star):
     # 核心推荐流程
     # -------------------------------------------------------------------------
 
-    async def _run_recommend(self, *, record_history: bool = True) -> None:
+    async def _run_recommend(
+        self,
+        *,
+        target_sessions: list[str] | None = None,
+        prompt_override: str | None = None,
+    ) -> None:
         async with self._lock:
             records: list[RecordDict] = self._history.get("records", [])
             history_list: list[AlbumInfo] = [
@@ -232,7 +242,7 @@ class DailyAlbumPlugin(Star):
             ]
             seen_keys: set[str] = set(self._history.get("seen_keys", []))
 
-            prompt: str = self.config.get(
+            prompt: str = prompt_override or self.config.get(
                 "recommend_prompt",
                 "请推荐一张值得深度聆听的经典或当代优秀专辑，涵盖各种音乐风格，注重艺术性和可听性。",
             )
@@ -280,7 +290,7 @@ class DailyAlbumPlugin(Star):
             self._history["last_push_date"] = today
             self._save_history()
 
-            await self._send_to_sessions(album, record_history=record_history)
+            await self._send_to_sessions(album, sessions_override=target_sessions)
 
     # -------------------------------------------------------------------------
     # 消息构建与发送
@@ -339,14 +349,19 @@ class DailyAlbumPlugin(Star):
         return text
 
     async def _send_to_sessions(
-        self, album: AlbumInfo, *, record_history: bool = True
+        self,
+        album: AlbumInfo,
+        *,
+        sessions_override: list[str] | None = None,
     ) -> None:
         """Per-session orchestrator：解析平台 → 生成文案 → 调 sender → 写历史。
 
         网易云搜索在循环外做一次，结果广播给所有 sender；
         每条 session 的文案 per-session 生成（人格化），互不影响。
         """
-        sessions: list[str] = self.config.get("target_sessions", [])
+        sessions: list[str] = sessions_override or self.config.get(
+            "target_sessions", []
+        )
         if not sessions:
             logger.warning("[DailyAlbum] target_sessions 为空，跳过推送")
             return
@@ -356,9 +371,7 @@ class DailyAlbumPlugin(Star):
             self.ctx, self.config, album.album_name, album.artist
         )
 
-        write_history: bool = record_history and bool(
-            self.config.get("record_history", True)
-        )
+        write_history: bool = bool(self.config.get("record_history", True))
 
         for session_str in sessions:
             resolved = select_sender(self.ctx, session_str)
@@ -505,49 +518,46 @@ class DailyAlbumPlugin(Star):
         """手动触发，推送到当前会话；可附带参数覆盖推荐偏好，如 /album_today 推荐一张emo专辑"""
         waiting: str = await self._generate_waiting_text(event.unified_msg_origin)
         yield event.plain_result(waiting)
-        original_sessions: list[str] = list(self.config.get("target_sessions", []))
-        original_prompt: str | None = self.config.get("recommend_prompt")
         # 命令后的文本作为临时 prompt
         custom_prompt: str = event.message_str.removeprefix("album_today").strip()
-        self.config["target_sessions"] = [event.unified_msg_origin]
-        if custom_prompt:
-            self.config["recommend_prompt"] = custom_prompt
-        try:
-            await self._run_recommend()
-        finally:
-            self.config["target_sessions"] = original_sessions
-            if custom_prompt:
-                if original_prompt is None:
-                    self.config.pop("recommend_prompt", None)
-                else:
-                    self.config["recommend_prompt"] = original_prompt
+        await self._run_recommend(
+            target_sessions=[event.unified_msg_origin],
+            prompt_override=custom_prompt or None,
+        )
         event.stop_event()
 
     @llm_tool("recommend_album")
     async def tool_recommend_album(
         self, event: AstrMessageEvent, prompt: str = ""
-    ) -> None:
+    ) -> str:
         """推荐一张专辑并发送到当前会话。当用户希望获得音乐或专辑推荐时调用此工具。
 
         Args:
             prompt(string): 可选。描述期望的专辑风格、流派、情绪或年代等偏好。留空则使用默认推荐偏好。
         """
-        original_sessions: list[str] = list(self.config.get("target_sessions", []))
-        original_prompt: str | None = self.config.get("recommend_prompt")
-        self.config["target_sessions"] = [event.unified_msg_origin]
-        if prompt:
-            self.config["recommend_prompt"] = prompt
-        try:
-            # 工具路径下，主 agent 会把工具调用结果记入历史，
-            # 这里再写一次会重复，所以强制关闭。
-            await self._run_recommend(record_history=False)
-        finally:
-            self.config["target_sessions"] = original_sessions
-            if prompt:
-                if original_prompt is None:
-                    self.config.pop("recommend_prompt", None)
-                else:
-                    self.config["recommend_prompt"] = original_prompt
+        # 推荐流水线本身可达 1~2 分钟，超过 agent 工具调用 120s 硬超时；
+        # 这里立即返回 ack，把真正的推荐放到后台任务里跑，由 sender 自行送达。
+        target: str = event.unified_msg_origin
+        eff_prompt: str | None = prompt or None
+
+        async def _bg() -> None:
+            try:
+                await self._run_recommend(
+                    target_sessions=[target],
+                    prompt_override=eff_prompt,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"[DailyAlbum] tool 后台推荐任务失败：{e}", exc_info=True
+                )
+
+        task: asyncio.Task[None] = asyncio.create_task(_bg())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+        return "已开始为你挑选今日专辑，结果稍后会发到当前会话。"
 
     @filter.command("album_history")
     async def cmd_history(
