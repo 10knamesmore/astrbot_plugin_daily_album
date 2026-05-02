@@ -97,6 +97,16 @@ class DailyAlbumPlugin(Star):
                 await self._init_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # AstrBot 的 add_basic_job(persistent=False) 仍会写 DB 行，
+        # 不显式 delete 会在每次 reload / 重启后留下残骸；这里清白离场。
+        if self._cron_job_id:
+            try:
+                await self.ctx.cron_manager.delete_job(self._cron_job_id)
+            except Exception as e:
+                logger.warning(
+                    f"[DailyAlbum] terminate 时删除 cron job 失败：{e}"
+                )
+            self._cron_job_id = None
         for t in list(self._bg_tasks):
             t.cancel()
         if self._bg_tasks:
@@ -151,46 +161,17 @@ class DailyAlbumPlugin(Star):
             hour, minute = 10, 0
         cron_expression: str = f"{minute} {hour} * * *"
 
+        # 进入前先把所有同名残留清干净——包括上一次没正常 terminate 留下的、
+        # 或更早期版本累积下来的。delete_job 会同时清 scheduler + DB。
+        # 不维护"幂等复用"分支：add_basic_job 本身就是一次轻量操作，
+        # 简化为"清理 + 新建"让 DB 里同名行 ≤ 1 成为简单不变量。
         existing: list[CronJob] = await self._list_own_jobs()
-
-        # 幂等复用：恰好一个、cron 一致、启用中 → 直接复用
-        if (
-            len(existing) == 1
-            and existing[0].cron_expression == cron_expression
-            and existing[0].enabled
-        ):
-            job: CronJob = existing[0]
-            manager = self.ctx.cron_manager
-            # handler 存在 CronJobManager._basic_handlers 里，按 job_id 索引；
-            # reload / 进程重启后新实例的 handler 方法地址会变，需要重绑。
-            manager._basic_handlers[job.job_id] = self._daily_handler
-            # persistent=False 的 job 进程重启时被 sync_from_db 跳过，
-            # 若 scheduler 里还没这条，就补一次 _schedule_job。
-            if not manager.scheduler.get_job(job.job_id):
-                try:
-                    manager._schedule_job(job)
-                except Exception as e:
-                    logger.warning(
-                        f"[DailyAlbum] 复用 job 调度失败：{e}，回退到重建"
-                    )
-                else:
-                    self._cron_job_id = job.job_id
-                    logger.info(
-                        f"[DailyAlbum] 复用 cron job（已补回调度器）：{job.job_id}"
-                    )
-                    return
-            else:
-                self._cron_job_id = job.job_id
-                logger.info(f"[DailyAlbum] 复用 cron job：{job.job_id}")
-                return
-
-        # 不一致、重复、或复用失败 → 全清理后重建
         for j in existing:
             try:
                 await self.ctx.cron_manager.delete_job(j.job_id)
-                logger.info(f"[DailyAlbum] 清理旧 cron job：{j.job_id}")
+                logger.info(f"[DailyAlbum] 清理残留 cron job：{j.job_id}")
             except Exception as e:
-                logger.warning(f"[DailyAlbum] 删除旧 job {j.job_id} 失败：{e}")
+                logger.warning(f"[DailyAlbum] 删除残留 job {j.job_id} 失败：{e}")
         self._cron_job_id = None
 
         try:
