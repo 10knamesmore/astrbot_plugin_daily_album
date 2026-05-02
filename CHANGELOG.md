@@ -3,6 +3,23 @@
 本文件遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [v0.0.9] - 2026-05-02
+
+修复 cron job 在 DB 中累积、WebUI "future task" 列表里堆一堆同名条目的问题。
+
+### 修复
+- `terminate()` 现在会显式 `delete_job(self._cron_job_id)`。AstrBot 的 `add_basic_job(persistent=False)` 仍会向 DB 写一行，且没有任何自动清理路径——之前每次 reload / 重启都会留一行残骸，长期累积。
+- `_setup_cron()` 改为"无条件清理同名行 + 新建一条"。原先的"幂等复用"分支只在 `len==1 && cron 匹配 && enabled` 时复用，遇到老版本残留 / 配置漂移 / 中途取消时会落到 cleanup-and-rebuild，并依赖每次 delete 都成功才能收敛；任何一次失败都会留下残骸。新版本把"DB 同名行 ≤ 1"做成简单不变量。
+
+### 变更
+- 不再 reach into `manager._basic_handlers` / `manager._schedule_job` 这种下划线 API，全部用公开的 `add_basic_job` / `delete_job`。
+
+### 兼容性
+- 配置项不变。
+- 升级后第一次 reload 会自动清理掉历史累积的同名 cron job。
+
+---
+
 ## [v0.0.8] - 2026-05-02
 
 修复 `recommend_album` 作为 LLM tool 调用时 120s 超时（[#1](https://github.com/10knamesmore/astrbot_plugin_daily_album/issues/1)）。
